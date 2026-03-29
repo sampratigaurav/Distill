@@ -400,42 +400,50 @@ async def download_sanitized(
 # MODAL SERVERLESS DEPLOYMENT CONFIGURATION
 # ==========================================
 import modal
+import os
 
 # 1. Define the Modal Application
 modal_app = modal.App("distill-backend")
 
-# 2. Define the Cloud Environment (Replaces requirements.txt & Dockerfile)
-distill_image = modal.Image.debian_slim().apt_install(
-    "libgl1-mesa-glx", 
-    "libglib2.0-0"
-).pip_install(
-    "fastapi", 
-    "uvicorn",
-    "python-multipart", 
-    "torch", 
-    "torchvision",
-    "scikit-learn", 
-    "pandas", 
-    "numpy", 
-    "opencv-python-headless", 
-    "pillow"
+# 2. Get the absolute path to the backend directory on the local machine
+backend_dir = os.path.dirname(os.path.abspath(__file__))
+
+# 3. Define the Cloud Environment & attach local files directly to the image
+distill_image = (
+    modal.Image.debian_slim()
+    .env({"PYTHONPATH": "/root"})  # Forces Python to look in /root for imports
+    .apt_install("libgl1-mesa-glx", "libglib2.0-0")
+    .pip_install(
+        "fastapi", 
+        "uvicorn",
+        "python-multipart", 
+        "torch", 
+        "torchvision",
+        "scikit-learn", 
+        "pandas", 
+        "numpy", 
+        "opencv-python-headless", 
+        "pillow"
+    )
+    # NEW MODAL 1.0 SYNTAX: Add local files directly to the image builder
+    .add_local_file(
+        os.path.join(backend_dir, "extractor.py"), remote_path="/root/extractor.py"
+    )
+    .add_local_file(
+        os.path.join(backend_dir, "models.py"), remote_path="/root/models.py"
+    )
 )
 
-# 3. Mount local files so the cloud container can see them
+# 4. Define the serverless function (no 'mounts' parameter needed here anymore)
 @modal_app.function(
     image=distill_image, 
     memory=4096, 
-    cpu=2.0,
-    mounts=[
-        modal.Mount.from_local_file("extractor.py", remote_path="/root/extractor.py"),
-        modal.Mount.from_local_file("models.py", remote_path="/root/models.py"),
-    ]
+    cpu=2.0
 )
 @modal.asgi_app()
 def serve():
     # Ensure the upload directory exists in the cloud container
-    import os
-    if not os.path.exists("temp_uploads"):
-        os.makedirs("temp_uploads")
+    if not os.path.exists("/root/temp_uploads"):
+        os.makedirs("/root/temp_uploads")
         
     return app
