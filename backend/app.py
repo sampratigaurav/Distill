@@ -24,7 +24,6 @@ from fastapi import FastAPI, File, Form, UploadFile, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import DataLoader, TensorDataset
 
 from extractor import UniversalExtractor
@@ -77,17 +76,15 @@ MODEL_ISO = "Isolation Forest"
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _calculate_mad_scores_and_flags(scores: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Calculate Median Absolute Deviation (MAD) of scores and flag robust outliers."""
-    median = float(np.median(scores))
-    mad = float(np.median(np.abs(scores - median)))
+def get_binary_votes(raw_scores: np.ndarray, n_samples: int) -> np.ndarray:
+    """Calculate MAD scaling with a strict limit check to prevent threshold squeezing."""
+    median = np.median(raw_scores)
+    mad = np.median(np.abs(raw_scores - median))
+    mad = np.maximum(mad, 1e-5) # Prevent zero-division
     
-    if mad < 1e-9:
-        return scores, np.zeros(len(scores), dtype=np.int32)
-        
-    modified_z = 0.6745 * (scores - median) / mad
-    flags = (modified_z > MAD_THRESHOLD).astype(np.int32)
-    return scores, flags
+    mod_z_scores = 0.6745 * (raw_scores - median) / mad
+    threshold = 4.0 if n_samples < 100 else 3.5
+    return (mod_z_scores > threshold).astype(np.int32)
 
 
 def _train_autoencoder(
@@ -130,14 +127,13 @@ def _train_autoencoder(
         reconstructions = model(tensor_data).numpy()
         errors = model.reconstruction_error(tensor_data).numpy()
 
-    scores, flags = _calculate_mad_scores_and_flags(errors)
-    return scores, flags, reconstructions
+    return errors, reconstructions
 
 
 def _train_deep_svdd(
     tensor_data: torch.Tensor, input_dim: int
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Train a DynamicDeepSVDD with Early Stopping; return (raw_scores, mad_flags)."""
+) -> np.ndarray:
+    """Train a DynamicDeepSVDD with Early Stopping; return raw_scores."""
     model = DynamicDeepSVDD(input_dim)
 
     # Initialize center c
@@ -179,23 +175,19 @@ def _train_deep_svdd(
     with torch.no_grad():
         distances = model.anomaly_score(tensor_data).numpy()
 
-    return _calculate_mad_scores_and_flags(distances)
+    return distances
 
 
-def _run_isolation_forest(feature_vectors: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Fit an IsolationForest and return (inverted_score_samples, binary_flags)."""
+def _run_isolation_forest(feature_vectors: np.ndarray) -> np.ndarray:
+    """Fit an IsolationForest and return continuous anomaly scores."""
     # Strict dynamic contamination for small datasets
     contam = max(0.001, min(0.05, 10.0 / len(feature_vectors)))
     iso = IsolationForest(contamination=contam, random_state=42)
-    preds = iso.fit_predict(feature_vectors)
+    iso.fit(feature_vectors)
     
-    # sklearn: -1 → anomaly, 1 → normal
-    flags = (preds == -1).astype(np.int32)
-    # score_samples are negative; lower is more anomalous.
-    # Invert so higher is more anomalous, aligning precisely with AE and SVDD.
-    raw_scores = -iso.score_samples(feature_vectors)
-    
-    return raw_scores, flags
+    # Sklearn decision_function returns negative values for outliers
+    raw_scores = -1.0 * iso.decision_function(feature_vectors)
+    return raw_scores
 
 
 def _generate_xai_payload(
@@ -233,7 +225,6 @@ def _build_flagged_items(
     ae_flags: np.ndarray,
     svdd_flags: np.ndarray,
     iso_flags: np.ndarray,
-    combined_norm: np.ndarray,
     feature_vectors: np.ndarray,
     reconstructions: np.ndarray,
     median_vector: np.ndarray,
@@ -241,8 +232,7 @@ def _build_flagged_items(
     """
     Build the enriched flagged-items list.
 
-    A sample is poisoned if its combined average score > 0.7 
-    OR if >= 2 models flagged it individually.
+    A sample is poisoned IF AND ONLY IF total_votes >= 2.
     """
     model_names = [MODEL_AE, MODEL_SVDD, MODEL_ISO]
     items: list[dict] = []
@@ -250,7 +240,8 @@ def _build_flagged_items(
     for i, ident in enumerate(identifiers):
         flags = [ae_flags[i], svdd_flags[i], iso_flags[i]]
         
-        is_poisoned = bool(combined_norm[i] > 0.7) or (sum(flags) >= 2)
+        total_votes = sum(flags)
+        is_poisoned = bool(total_votes >= 2)
         if not is_poisoned:
             continue
             
@@ -286,6 +277,11 @@ async def scan_dataset(request: Request, file: UploadFile = File(...)):
         raise HTTPException(status_code=413, detail="Dataset exceeds 1GB limit.")
 
     try:
+        import random
+        torch.manual_seed(42)
+        np.random.seed(42)
+        random.seed(42)
+
         # 1. Extract features
         feature_vectors, identifiers = await extractor.process_upload(file)
         n_samples, input_dim = feature_vectors.shape
@@ -293,26 +289,22 @@ async def scan_dataset(request: Request, file: UploadFile = File(...)):
         # 2. Prepare PyTorch tensor
         tensor_data = torch.tensor(feature_vectors, dtype=torch.float32)
 
-        # 3. Run all three detectors
-        ae_scores, ae_flags, ae_recons = _train_autoencoder(tensor_data, input_dim)
-        svdd_scores, svdd_flags = _train_deep_svdd(tensor_data, input_dim)
-        iso_scores, iso_flags = _run_isolation_forest(feature_vectors)
+        # 3. Run all three detectors to get raw scores
+        raw_ae, ae_recons = _train_autoencoder(tensor_data, input_dim)
+        raw_svdd = _train_deep_svdd(tensor_data, input_dim)
+        raw_if = _run_isolation_forest(feature_vectors)
 
-        # 4. Model Normalization
-        scaler = MinMaxScaler()
-        ae_norm = scaler.fit_transform(ae_scores.reshape(-1, 1)).flatten()
-        svdd_norm = scaler.fit_transform(svdd_scores.reshape(-1, 1)).flatten()
-        iso_norm = scaler.fit_transform(iso_scores.reshape(-1, 1)).flatten()
-        
-        # 5. Combined Average Normalized Score
-        combined_norm = (ae_norm + svdd_norm + iso_norm) / 3.0
+        # 4. Strict Consensus Voting
+        ae_flags = get_binary_votes(raw_ae, n_samples)
+        svdd_flags = get_binary_votes(raw_svdd, n_samples)
+        iso_flags = get_binary_votes(raw_if, n_samples)
 
         # Calculate median vector for Image XAI
         median_vector = np.median(feature_vectors, axis=0)
 
-        # 6. Build enriched results
+        # 5. Build enriched results
         flagged_items = _build_flagged_items(
-            identifiers, ae_flags, svdd_flags, iso_flags, combined_norm, feature_vectors, ae_recons, median_vector
+            identifiers, ae_flags, svdd_flags, iso_flags, feature_vectors, ae_recons, median_vector
         )
         poisoned_count = len(flagged_items)
         anomaly_pct = round((poisoned_count / n_samples) * 100, 2)
