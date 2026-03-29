@@ -1,0 +1,49 @@
+@import "tailwindcss";
+
+@theme inline {
+  --color-background: #0b1120;
+  --color-foreground: #e2e8f0;
+  --color-surface: #111827;
+  --color-surface-light: #1e293b;
+  --color-border: #1e3a5f;
+  --color-neon: #38bdf8;
+  --color-neon-glow: #0ea5e980;
+  --color-danger: #ef4444;
+  --color-danger-glow: #ef444480;
+  --color-warning: #f97316;
+  --color-clean: #22d3ee;
+  --color-poisoned: #f43f5e;
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #1e3a5f #0b1120;
+}
+
+body {
+  background: var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-sans), system-ui, sans-serif;
+}
+
+/* ── Neon glow pulse ──────────────────────────────────── */
+@keyframes neon-pulse {
+  0%, 100% { box-shadow: 0 0 8px var(--color-neon-glow), 0 0 24px var(--color-neon-glow); }
+  50%      { box-shadow: 0 0 16px var(--color-neon-glow), 0 0 48px var(--color-neon-glow); }
+}
+
+@keyframes scan-line {
+  0%   { transform: translateY(-100%); }
+  100% { transform: translateY(100%); }
+}
+
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.animate-neon-pulse { animation: neon-pulse 2s ease-in-out infinite; }
+.animate-scan-line  { animation: scan-line 1.5s ease-in-out infinite; }
+.animate-fade-up    { animation: fade-up 0.5s ease-out both; }
