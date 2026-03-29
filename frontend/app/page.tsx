@@ -211,11 +211,10 @@ export default function HomePage() {
           </div>
           <div>
             <h1 className="text-xl font-bold tracking-tight text-white">
-              AICS Universal Sanitizer
+              Distill
             </h1>
             <p className="text-sm text-slate-400 mt-0.5">
-              Scan CSV datasets &amp; ZIP image archives for data poisoning
-              using ensemble anomaly detection
+              Universal Data Sanitization &amp; Poisoning Detection
             </p>
           </div>
           {/* status pill */}
@@ -308,7 +307,7 @@ export default function HomePage() {
             </div>
             <div className="text-center">
               <p className="text-base font-semibold text-white">
-                Scanning in progress…
+                Distilling dataset…
               </p>
               <p className="mt-1 text-sm text-slate-400 max-w-md">
                 Extracting universal features and running ensemble detection
@@ -328,7 +327,7 @@ export default function HomePage() {
               <div>
                 <h3 className="text-lg font-bold text-white flex items-center gap-2">
                   <ShieldCheck className="h-5 w-5 text-emerald-400" />
-                  Sanitization Complete
+                  Distillation Complete
                 </h3>
                 <p className="text-sm text-slate-400 mt-1">
                   Removed {results.poisoned_samples} anomalous items. Your data is ready.
@@ -338,16 +337,16 @@ export default function HomePage() {
               <button
                 onClick={handleDownloadSanitized}
                 disabled={isDownloading}
-                className="relative inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-cyan-500 to-sky-600 px-6 py-3 text-sm font-bold text-white shadow-lg shadow-cyan-500/25 transition-all hover:shadow-cyan-400/40 hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-50 disabled:pointer-events-none"
+                className="relative inline-flex items-center gap-2 rounded-xl bg-slate-800 border border-slate-600 px-6 py-3 text-sm font-bold text-slate-200 shadow-md transition-all hover:text-cyan-300 hover:border-cyan-400 hover:shadow-[0_0_20px_rgba(34,211,238,0.4)] hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-50 disabled:pointer-events-none"
               >
                 {isDownloading ? (
                   <>
                     <Loader2 className="h-4 w-4 animate-spin" />
-                    Packaging Clean Data...
+                    Packaging Distilled Data...
                   </>
                 ) : (
                   <>
-                    <Download className="h-4 w-4" />
+                    <Download className="h-4 w-4 text-cyan-400" />
                     Download Sanitized Dataset
                   </>
                 )}
