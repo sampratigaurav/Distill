@@ -394,3 +394,48 @@ async def download_sanitized(
 
     from fastapi import HTTPException
     raise HTTPException(status_code=400, detail="Unsupported file type.")
+
+
+# ==========================================
+# MODAL SERVERLESS DEPLOYMENT CONFIGURATION
+# ==========================================
+import modal
+
+# 1. Define the Modal Application
+modal_app = modal.App("distill-backend")
+
+# 2. Define the Cloud Environment (Replaces requirements.txt & Dockerfile)
+distill_image = modal.Image.debian_slim().apt_install(
+    "libgl1-mesa-glx", 
+    "libglib2.0-0"
+).pip_install(
+    "fastapi", 
+    "uvicorn",
+    "python-multipart", 
+    "torch", 
+    "torchvision",
+    "scikit-learn", 
+    "pandas", 
+    "numpy", 
+    "opencv-python-headless", 
+    "pillow"
+)
+
+# 3. Mount local files so the cloud container can see them
+@modal_app.function(
+    image=distill_image, 
+    memory=4096, 
+    cpu=2.0,
+    mounts=[
+        modal.Mount.from_local_file("extractor.py", remote_path="/root/extractor.py"),
+        modal.Mount.from_local_file("models.py", remote_path="/root/models.py"),
+    ]
+)
+@modal.asgi_app()
+def serve():
+    # Ensure the upload directory exists in the cloud container
+    import os
+    if not os.path.exists("temp_uploads"):
+        os.makedirs("temp_uploads")
+        
+    return app
