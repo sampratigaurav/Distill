@@ -242,10 +242,15 @@ class UniversalExtractor:
 
     def _load_resnet(self) -> None:
         """Lazy-init a headless ResNet-18 feature extractor."""
+        # --- SAFE FIX: Detect device and move model to GPU if available ---
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
         resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
         resnet.fc = nn.Identity()
         resnet.eval()
-        self._resnet = resnet
+        
+        self._resnet = resnet.to(self.device)
+        # ------------------------------------------------------------------
 
         self._transform = T.Compose([
             T.Resize((224, 224)),
@@ -283,8 +288,20 @@ class UniversalExtractor:
 
         batch = torch.stack(tensors)
 
+        # --- SAFE FIX: Process in chunks to prevent OOM ---
+        embeddings_list = []
+        chunk_size = 64
+        
         with torch.no_grad():
-            embeddings: torch.Tensor = self._resnet(batch)  # type: ignore[misc]
+            for i in range(0, len(batch), chunk_size):
+                # --- SAFE FIX: Move chunk to GPU before passing to ResNet ---
+                chunk = batch[i:i + chunk_size].to(self.device)
+                chunk_embeds = self._resnet(chunk)
+                embeddings_list.append(chunk_embeds)
+                # ------------------------------------------------------------
+                
+        embeddings = torch.cat(embeddings_list, dim=0)
+        # --------------------------------------------------
 
         features = embeddings.cpu().numpy().astype(np.float32)
         return features, filenames

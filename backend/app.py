@@ -176,13 +176,24 @@ def _train_deep_svdd(
 ) -> np.ndarray:
     """Train a DynamicDeepSVDD with Early Stopping; return raw_scores."""
     model = DynamicDeepSVDD(input_dim).to(device)
-    tensor_data_dev = tensor_data.to(device)
-
+    
     # Initialize center c
     model.eval()
+    
+    # --- SAFE FIX: Batch the center initialization to prevent OOM ---
+    center_loader = DataLoader(
+        TensorDataset(tensor_data), batch_size=BATCH_SIZE, shuffle=False
+    )
+    initial_outputs = []
+    
     with torch.no_grad():
-        initial_out = model(tensor_data_dev)
-        model.center.copy_(initial_out.mean(dim=0))
+        for (c_batch,) in center_loader:
+            initial_outputs.append(model(c_batch.to(device)))
+            
+    # Calculate the mean across all batches
+    all_initial_out = torch.cat(initial_outputs, dim=0)
+    model.center.copy_(all_initial_out.mean(dim=0))
+    # ----------------------------------------------------------------
 
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
