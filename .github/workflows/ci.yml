@@ -64,12 +64,15 @@ jobs:
         run: npm install -g vercel@latest
 
       - name: Deploy to Vercel (production)
-        working-directory: frontend
+        # Note: working-directory is REMOVED here so we run from the repo root
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-        run: vercel deploy --prod --yes --cwd . --token ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          vercel pull --yes --environment=production --token ${{ secrets.VERCEL_TOKEN }}
+          vercel build --prod --token ${{ secrets.VERCEL_TOKEN }}
+          vercel deploy --prebuilt --prod --token ${{ secrets.VERCEL_TOKEN }}
 
   # ──────────────────────────────────────────────────────────────────────────
   # 3. Deploy backend to Modal  (main branch only, after tests pass)
