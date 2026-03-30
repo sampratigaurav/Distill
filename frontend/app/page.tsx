@@ -67,29 +67,36 @@ interface ScanResults {
 /* Constants                                                           */
 /* ------------------------------------------------------------------ */
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const MAX_FILE_SIZE = 1024 * 1024 * 1024; // 1GB
+const MAX_FILE_SIZE = 1024 * 1024 * 1024; // 1 GB
 
-const CHART_COLORS = {
-  clean: "#22d3ee",
-  poisoned: "#f43f5e",
-};
+/** Chart: clean = green, poisoned = red */
+const CHART_COLORS = { clean: "#22c55e", poisoned: "#ef4444" };
 
-/** Per-model badge + bar colors */
+/** Per-model colors — orange / red / zinc monochrome palette */
 const MODEL_COLORS: Record<string, { bg: string; text: string; bar: string }> = {
-  Autoencoder:        { bg: "bg-violet-500/15", text: "text-violet-400", bar: "#a78bfa" },
-  "Deep SVDD":        { bg: "bg-amber-500/15",  text: "text-amber-400",  bar: "#fbbf24" },
-  "Isolation Forest": { bg: "bg-sky-500/15",    text: "text-sky-400",    bar: "#38bdf8" },
+  Autoencoder:        { bg: "bg-orange-500/10", text: "text-orange-500", bar: "#f97316" },
+  "Deep SVDD":        { bg: "bg-red-500/10",    text: "text-red-500",    bar: "#ef4444" },
+  "Isolation Forest": { bg: "bg-zinc-500/10",   text: "text-zinc-300",   bar: "#d4d4d8" },
 };
+const DEFAULT_MODEL_STYLE = { bg: "bg-red-500/10", text: "text-red-500", bar: "#ef4444" };
 
-const DEFAULT_MODEL_STYLE = { bg: "bg-rose-500/15", text: "text-rose-400", bar: "#f43f5e" };
+/** Tooltip style shared across all charts */
+const TOOLTIP_STYLE = {
+  backgroundColor: "#18181b", // zinc-900
+  border: "1px solid #27272a", // zinc-800
+  borderRadius: "0",
+  fontSize: "12px",
+  color: "#f4f4f5", // zinc-100
+  fontFamily: "var(--font-geist-mono), monospace",
+};
 
 /** Stepped status messages shown during the processing phase */
 const SCAN_MESSAGES = [
-  "Initiating PyTorch models...",
-  "Training Autoencoder on base patterns...",
-  "Calculating Isolation Forest boundaries...",
-  "Scanning rows for anomalies...",
-  "Finalizing ensemble votes...",
+  "[INITIATING PYTORCH MODELS...]",
+  "[TRAINING AUTOENCODER...]",
+  "[CALCULATING ISOLATION BOUNDARIES...]",
+  "[SCANNING ROWS...]",
+  "[FINALIZING ENSEMBLE VOTES...]",
 ] as const;
 
 /* ------------------------------------------------------------------ */
@@ -112,10 +119,9 @@ export default function HomePage() {
     if (f && f.size > MAX_FILE_SIZE) {
       setFile(null);
       setResults(null);
-      setError("File too large. Maximum limit is 1GB.");
+      setError("File too large. Maximum limit is 1 GB.");
       return;
     }
-
     setFile(f);
     setResults(null);
     setError(null);
@@ -130,7 +136,7 @@ export default function HomePage() {
     [handleFile]
   );
 
-  /* ---- Step message cycler (runs only during processing phase) ---- */
+  /* ---- Step message cycler -------------------------------------- */
   useEffect(() => {
     if (scanPhase !== "processing") return;
     setStepIndex(0);
@@ -152,20 +158,16 @@ export default function HomePage() {
       const formData = new FormData();
       formData.append("file", file);
 
-      // Switch to processing phase once the request is sent
       const requestPromise = axios.post<ScanResults>(
         `${API_URL}/scan-dataset`,
         formData,
         {
           onUploadProgress: (progressEvent) => {
-            if (progressEvent.progress === 1) {
-              setScanPhase("processing");
-            }
+            if (progressEvent.progress === 1) setScanPhase("processing");
           },
         }
       );
 
-      // Ensure we enter processing phase even if onUploadProgress fires late
       setScanPhase("processing");
       const { data } = await requestPromise;
       setResults(data);
@@ -185,27 +187,23 @@ export default function HomePage() {
     }
   };
 
-  /* ---- Download File -------------------------------------------- */
+  /* ---- Download ------------------------------------------------- */
   const handleDownloadSanitized = async () => {
     if (!file || !results) return;
     setIsDownloading(true);
+
     try {
-      const flaggedIds = results.flagged_items.map((i) => i.id);
-      
       const formData = new FormData();
       formData.append("file", file);
-      formData.append("flagged_items", JSON.stringify(flaggedIds));
+      formData.append("flagged_items", JSON.stringify(results.flagged_items));
       formData.append("scan_results_json", JSON.stringify(results));
 
       const response = await axios.post(`${API_URL}/download-sanitized`, formData);
-
       const { download_url, filename } = response.data;
       const link = document.createElement("a");
-      
-      const baseUrl = API_URL.endsWith('/') ? API_URL.slice(0, -1) : API_URL;
+      const baseUrl = API_URL.endsWith("/") ? API_URL.slice(0, -1) : API_URL;
       link.href = `${baseUrl}${download_url}`;
       link.setAttribute("download", filename || "sanitized_data.zip");
-      
       document.body.appendChild(link);
       link.click();
       link.parentNode?.removeChild(link);
@@ -223,17 +221,12 @@ export default function HomePage() {
   /* ---- Derived data --------------------------------------------- */
   const chartData = results
     ? [
-        {
-          name: "Clean",
-          value: results.total_samples - results.poisoned_samples,
-        },
+        { name: "Clean", value: results.total_samples - results.poisoned_samples },
         { name: "Poisoned", value: results.poisoned_samples },
       ]
     : [];
 
-  const cleanPct = results
-    ? (100 - results.anomaly_percentage).toFixed(2)
-    : null;
+  const cleanPct = results ? (100 - results.anomaly_percentage).toFixed(2) : null;
 
   const filteredItems = results
     ? results.flagged_items.filter((item) =>
@@ -253,42 +246,42 @@ export default function HomePage() {
   /* Render                                                           */
   /* ---------------------------------------------------------------- */
   return (
-    <main className="flex-1 flex flex-col">
+    <main className="flex-1 flex flex-col min-h-screen bg-zinc-950 font-sans text-white">
       {/* ── Header ──────────────────────────────────────────────── */}
-      <header className="border-b border-[var(--color-border)] bg-[var(--color-surface)]/80 backdrop-blur-sm sticky top-0 z-50">
-        <div className="mx-auto max-w-7xl px-6 py-5 flex items-center gap-4">
-          <div className="rounded-xl bg-gradient-to-br from-sky-500 to-cyan-400 p-2.5 shadow-lg shadow-sky-500/20">
-            <ShieldCheck className="h-6 w-6 text-white" />
+      <header className="border-b border-zinc-800 bg-zinc-900 sticky top-0 z-50">
+        <div className="mx-auto max-w-7xl px-6 py-4 flex items-center gap-3">
+          {/* Logo mark — sharp square with orange accent */}
+          <div className="border border-orange-500 bg-orange-500/10 p-2 rounded-none">
+            <ShieldCheck className="h-5 w-5 text-orange-500" />
           </div>
           <div>
-            <h1 className="text-xl font-bold tracking-tight text-white">
-              Distill
+            <h1 className="text-base font-bold tracking-widest uppercase text-white font-mono">
+              DISTILL
             </h1>
-            <p className="text-sm text-slate-400 mt-0.5">
+            <p className="text-[10px] text-zinc-500 tracking-wider uppercase font-mono">
               Universal Data Sanitization &amp; Poisoning Detection
             </p>
           </div>
-          {/* status pill */}
-          <span className="ml-auto inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-400 ring-1 ring-emerald-500/20">
-            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+
+          {/* status indicator */}
+          <span className="ml-auto inline-flex items-center gap-1.5 border border-zinc-800 px-3 py-1 text-[10px] font-mono font-medium text-zinc-400 uppercase tracking-wider rounded-none">
+            <span className="h-1.5 w-1.5 bg-green-500 animate-pulse rounded-none" />
             System Online
           </span>
         </div>
       </header>
 
-      {/* ── Body ──────────────────────────────────────────────────── */}
-      <div className="mx-auto w-full max-w-7xl px-6 py-10 flex flex-col gap-10">
-        {/* ── Upload Zone ──────────────────────────────────────────── */}
+      {/* ── Body ─────────────────────────────────────────────────── */}
+      <div className="mx-auto w-full max-w-7xl px-6 py-10 flex flex-col gap-8">
+
+        {/* ── Upload Zone ─────────────────────────────────────────── */}
         <section
           id="upload-zone"
           onDragOver={(e) => e.preventDefault()}
           onDrop={onDrop}
           onClick={() => fileInputRef.current?.click()}
-          className="group relative cursor-pointer rounded-2xl border-2 border-dashed border-[var(--color-border)] bg-[var(--color-surface)] hover:border-sky-500/60 transition-all duration-300 p-10 text-center"
+          className="group relative cursor-pointer border border-dashed border-zinc-800 bg-zinc-900 hover:border-orange-500 transition-colors duration-0 p-10 text-center rounded-none"
         >
-          {/* subtle gradient shimmer on hover */}
-          <div className="pointer-events-none absolute inset-0 rounded-2xl bg-gradient-to-br from-sky-500/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
-
           <input
             ref={fileInputRef}
             id="file-input"
@@ -299,49 +292,46 @@ export default function HomePage() {
           />
 
           {file ? (
-            <div className="flex flex-col items-center gap-3 animate-fade-up">
-              <FileText className="h-12 w-12 text-sky-400" />
-              <p className="text-lg font-semibold text-white">{file.name}</p>
-              <p className="text-sm text-slate-400">
-                {(file.size / 1024).toFixed(1)} KB — Click or drop to replace
+            <div className="flex flex-col items-center gap-3">
+              <FileText className="h-10 w-10 text-orange-500" />
+              <p className="font-mono text-base font-semibold text-white">{file.name}</p>
+              <p className="font-mono text-xs text-zinc-500">
+                {(file.size / 1024).toFixed(1)} KB — click or drop to replace
               </p>
             </div>
           ) : (
             <div className="flex flex-col items-center gap-3">
-              <Upload className="h-12 w-12 text-slate-500 group-hover:text-sky-400 transition-colors" />
-              <p className="text-lg font-medium text-slate-300">
+              <Upload className="h-10 w-10 text-zinc-600 group-hover:text-orange-500 transition-colors duration-0" />
+              <p className="text-sm font-medium text-zinc-400">
                 Drag &amp; drop your file here
               </p>
-              <p className="text-sm text-slate-500">
-                Supports <span className="text-sky-400">.csv</span> and{" "}
-                <span className="text-sky-400">.zip</span> (image archives)
+              <p className="font-mono text-xs text-zinc-600">
+                <span className="text-orange-500">.csv</span> tabular data &nbsp;·&nbsp;{" "}
+                <span className="text-orange-500">.zip</span> image archives
               </p>
             </div>
           )}
         </section>
 
-        {/* ── Scan Button ─────────────────────────────────────────── */}
-        <div className="flex justify-center">
+        {/* ── Scan Button ────────────────────────────────────────── */}
+        <div className="flex items-center justify-between gap-4">
           <button
             id="scan-button"
             disabled={!file || isScanning}
             onClick={scanDataset}
-            className="relative inline-flex items-center gap-2.5 rounded-xl bg-gradient-to-r from-sky-600 to-cyan-500 px-8 py-3.5 text-sm font-bold text-white shadow-lg shadow-sky-600/25 transition-all hover:shadow-sky-500/40 hover:scale-[1.03] active:scale-[0.98] disabled:opacity-40 disabled:pointer-events-none disabled:shadow-none"
+            className="inline-flex items-center gap-2 border border-orange-500 bg-orange-500 px-8 py-2.5 text-sm font-bold font-mono text-black uppercase tracking-widest transition-none hover:bg-orange-400 active:bg-orange-600 disabled:bg-zinc-800 disabled:border-zinc-700 disabled:text-zinc-600 disabled:pointer-events-none rounded-none"
           >
             <Activity className="h-4 w-4" />
             {scanPhase === "upload"
-              ? "Uploading…"
+              ? "[ UPLOADING... ]"
               : scanPhase === "processing"
-              ? "Processing…"
-              : "Scan Dataset"}
+              ? "[ PROCESSING... ]"
+              : "SCAN DATASET"}
           </button>
-        </div>
 
-        {/* ── Privacy Guarantee Badge ──────────────────────────── */}
-        <div className="flex justify-center">
-          <span className="inline-flex items-center gap-2 rounded-full bg-emerald-500/10 px-4 py-1.5 text-xs font-medium text-emerald-400 ring-1 ring-emerald-500/20">
-            <ShieldCheck className="h-3.5 w-3.5" />
-            Data is processed in memory and immediately destroyed.
+          <span className="inline-flex items-center gap-1.5 text-[10px] font-mono text-zinc-600 uppercase tracking-wider">
+            <ShieldCheck className="h-3 w-3" />
+            Processed in memory · zero retention
           </span>
         </div>
 
@@ -349,56 +339,52 @@ export default function HomePage() {
         {error && (
           <div
             id="error-banner"
-            className="rounded-xl border border-red-500/30 bg-red-500/10 px-5 py-4 text-sm text-red-300 flex items-start gap-3 animate-fade-up"
+            className="border border-red-500 bg-red-500/10 px-4 py-3 text-xs font-mono text-red-500 flex items-start gap-3 rounded-none"
           >
-            <AlertTriangle className="h-5 w-5 shrink-0 mt-0.5 text-red-400" />
+            <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
             <span>{error}</span>
           </div>
         )}
 
-        {/* ── Scanning Animation ─────────────────────────────────── */}
+        {/* ── Scanning State ─────────────────────────────────────── */}
         {isScanning && (
-          <div className="flex flex-col items-center gap-6 py-12 animate-fade-up">
+          <div className="border border-zinc-800 bg-zinc-900 px-6 py-10 flex flex-col items-center gap-6 rounded-none">
             {/* scanner box */}
-            <div className="relative h-40 w-40 rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] overflow-hidden">
-              {/* sweep line */}
-              <div className="absolute inset-x-0 h-0.5 bg-gradient-to-r from-transparent via-sky-400 to-transparent animate-scan-line" />
-              {/* center icon */}
+            <div className="relative h-28 w-28 border border-zinc-800 bg-zinc-950 overflow-hidden rounded-none">
+              <div className="absolute inset-x-0 h-px bg-orange-500 animate-scan-line opacity-80" />
               <div className="flex h-full items-center justify-center">
-                <ShieldAlert className="h-14 w-14 text-sky-400 animate-pulse" />
+                <ShieldAlert className="h-10 w-10 text-orange-500" />
               </div>
             </div>
 
-            {/* ── Phase indicator ───────────────────────────────────── */}
+            {/* Phase text */}
             {scanPhase === "upload" ? (
-              <div className="w-full max-w-sm flex flex-col items-center gap-3">
-                <p className="text-sm font-semibold text-sky-300 flex items-center gap-2">
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Uploading dataset…
+              <div className="flex flex-col items-center gap-3 w-full max-w-xs">
+                <p className="font-mono text-xs text-orange-500 flex items-center gap-2 uppercase tracking-widest">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  [UPLOADING PAYLOAD...]
                 </p>
-                {/* indeterminate progress bar */}
-                <div className="w-full h-1.5 rounded-full bg-slate-700 overflow-hidden">
-                  <div className="h-full w-1/3 rounded-full bg-gradient-to-r from-sky-500 to-cyan-400 animate-[progress-slide_1.4s_ease-in-out_infinite]" />
+                <div className="w-full h-px bg-zinc-800 overflow-hidden">
+                  <div className="h-full w-1/4 bg-orange-500 animate-[progress-slide_1.4s_ease-in-out_infinite]" />
                 </div>
               </div>
             ) : (
-              <div className="w-full max-w-sm flex flex-col items-center gap-3">
-                {/* stepped message */}
+              <div className="flex flex-col items-center gap-4 w-full max-w-xs">
                 <p
                   key={stepIndex}
-                  className="text-sm font-semibold text-cyan-300 animate-fade-up text-center"
+                  className="font-mono text-xs text-orange-500 text-center uppercase tracking-widest animate-fade-in"
                 >
                   {SCAN_MESSAGES[stepIndex]}
                 </p>
-                {/* step dots */}
-                <div className="flex gap-1.5">
+                {/* step marker dots */}
+                <div className="flex gap-1 border border-zinc-800 p-1">
                   {SCAN_MESSAGES.map((_, i) => (
                     <span
                       key={i}
-                      className={`h-1.5 rounded-full transition-all duration-500 ${
+                      className={`h-2 transition-none duration-0 ${
                         i === stepIndex
-                          ? "w-5 bg-cyan-400"
-                          : "w-1.5 bg-slate-600"
+                          ? "w-8 bg-orange-500"
+                          : "w-2 bg-zinc-800"
                       }`}
                     />
                   ))}
@@ -410,90 +396,87 @@ export default function HomePage() {
 
         {/* ── Results Dashboard ──────────────────────────────────── */}
         {results && !isScanning && (
-          <div className="flex flex-col gap-8 animate-fade-up border-t border-[var(--color-border)] pt-8">
-            
-            {/* ── Action Header (Download) ─────────────────────────── */}
-            <div className="flex flex-col sm:flex-row items-center justify-between gap-4 bg-[var(--color-surface)] rounded-2xl p-6 border border-[var(--color-border)] shadow-xl relative overflow-hidden group">
-              <div className="absolute inset-x-0 bottom-0 h-1 bg-gradient-to-r from-cyan-500 via-sky-400 to-indigo-500 opacity-50"></div>
+          <div className="flex flex-col gap-6 border-t border-zinc-800 pt-8">
+
+            {/* ── Action Header ──────────────────────────────────── */}
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 border border-zinc-800 bg-zinc-900 p-5 rounded-none">
               <div>
-                <h3 className="text-lg font-bold text-white flex items-center gap-2">
-                  <ShieldCheck className="h-5 w-5 text-emerald-400" />
+                <h3 className="font-mono text-sm font-bold text-white uppercase tracking-widest flex items-center gap-2">
+                  <ShieldCheck className="h-4 w-4 text-green-500" />
                   Distillation Complete
                 </h3>
-                <p className="text-sm text-slate-400 mt-1">
-                  Removed {results.poisoned_samples} anomalous items. Your data is ready.
+                <p className="font-mono text-xs text-zinc-500 mt-1">
+                  {results.poisoned_samples} anomalies removed. Dataset safe for downstream ops.
                 </p>
               </div>
 
               <button
                 onClick={handleDownloadSanitized}
                 disabled={isDownloading}
-                className="relative inline-flex items-center gap-2 rounded-xl bg-slate-800 border border-slate-600 px-6 py-3 text-sm font-bold text-slate-200 shadow-md transition-all hover:text-cyan-300 hover:border-cyan-400 hover:shadow-[0_0_20px_rgba(34,211,238,0.4)] hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-50 disabled:pointer-events-none"
+                className="inline-flex items-center gap-2 border border-zinc-700 bg-zinc-800 px-5 py-2.5 text-xs font-mono font-bold text-white uppercase tracking-widest transition-none hover:border-orange-500 hover:text-orange-500 active:bg-orange-500 active:text-black disabled:opacity-50 disabled:pointer-events-none rounded-none"
               >
                 {isDownloading ? (
                   <>
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    Packaging Distilled Data...
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    PACKAGING...
                   </>
                 ) : (
                   <>
-                    <Download className="h-4 w-4 text-cyan-400" />
-                    Download Sanitized Dataset
+                    <Download className="h-3.5 w-3.5" />
+                    DOWNLOAD PAYLOAD
                   </>
                 )}
               </button>
             </div>
 
             {/* ── Metric Cards ────────────────────────────────────── */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-5">
-              {/* Total Samples */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-px bg-zinc-800">
               <MetricCard
                 id="metric-total"
-                icon={<Database className="h-5 w-5" />}
+                icon={<Database className="h-4 w-4" />}
                 label="Total Samples"
                 value={results.total_samples.toLocaleString()}
-                accent="sky"
+                accent="neutral"
               />
-              {/* Poisoned Samples */}
               <MetricCard
                 id="metric-poisoned"
-                icon={<Bug className="h-5 w-5" />}
+                icon={<Bug className="h-4 w-4" />}
                 label="Poisoned Samples"
                 value={results.poisoned_samples.toLocaleString()}
-                accent="rose"
+                accent="danger"
               />
-              {/* Anomaly Percentage */}
               <MetricCard
                 id="metric-pct"
-                icon={<Percent className="h-5 w-5" />}
+                icon={<Percent className="h-4 w-4" />}
                 label="Anomaly Rate"
                 value={`${results.anomaly_percentage}%`}
-                accent={results.anomaly_percentage > 5 ? "rose" : "sky"}
+                accent={results.anomaly_percentage > 5 ? "danger" : "neutral"}
                 large
               />
             </div>
 
-            {/* ── Charts Row: Donut + Bar + Flagged ────────────── */}
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
-              {/* ── Donut Chart ──────────────────────────────────── */}
+            {/* ── Charts Row ──────────────────────────────────────── */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-px bg-zinc-800">
+
+              {/* ── Donut Chart ───────────────────────────────────── */}
               <div
                 id="chart-card"
-                className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] p-6"
+                className="bg-zinc-900 p-5 rounded-none"
               >
-                <h2 className="text-sm font-semibold text-slate-300 mb-4 flex items-center gap-2">
-                  <Activity className="h-4 w-4 text-sky-400" />
+                <h2 className="font-mono text-[10px] font-semibold text-zinc-500 uppercase tracking-widest mb-4 flex items-center gap-2">
+                  <Activity className="h-3.5 w-3.5 text-orange-500" />
                   Data Integrity
                 </h2>
 
-                <ResponsiveContainer width="100%" height={280}>
+                <ResponsiveContainer width="100%" height={260}>
                   <PieChart>
                     <Pie
                       data={chartData}
                       cx="50%"
-                      cy="45%"
-                      innerRadius={62}
-                      outerRadius={96}
-                      paddingAngle={4}
+                      cy="44%"
+                      innerRadius={58}
+                      outerRadius={90}
+                      paddingAngle={2}
                       dataKey="value"
                       strokeWidth={0}
                       label={false}
@@ -502,105 +485,71 @@ export default function HomePage() {
                       <Cell fill={CHART_COLORS.clean} />
                       <Cell fill={CHART_COLORS.poisoned} />
                     </Pie>
-
-                    {/* ── Custom SVG center text ── */}
                     <text
                       x="50%"
-                      y="42%"
+                      y="41%"
                       textAnchor="middle"
                       dominantBaseline="central"
-                      className="fill-cyan-300"
-                      style={{ fontSize: "28px", fontWeight: 800 }}
+                      style={{ fill: "#f4f4f5", fontSize: "26px", fontWeight: 800, fontFamily: "var(--font-geist-mono)" }}
                     >
                       {cleanPct}%
                     </text>
                     <text
                       x="50%"
-                      y="52%"
+                      y="51%"
                       textAnchor="middle"
                       dominantBaseline="central"
-                      className="fill-slate-500"
-                      style={{ fontSize: "11px", fontWeight: 500 }}
+                      style={{ fill: "#71717a", fontSize: "10px", fontFamily: "var(--font-geist-mono)", letterSpacing: "0.1em" }}
                     >
-                      Clean
+                      CLEAN
                     </text>
-
-                    <Tooltip
-                      contentStyle={{
-                        backgroundColor: "#1e293b",
-                        borderColor: "#334155",
-                        borderRadius: "12px",
-                        fontSize: "13px",
-                        color: "#fff",
-                      }}
-                      itemStyle={{ color: "#e2e8f0" }}
-                    />
+                    <Tooltip contentStyle={TOOLTIP_STYLE} itemStyle={{ color: "#f4f4f5" }} cursor={false} />
                     <Legend
-                      iconType="circle"
+                      iconType="square"
+                      iconSize={8}
                       verticalAlign="bottom"
                       align="center"
-                      wrapperStyle={{
-                        fontSize: "12px",
-                        color: "#94a3b8",
-                        paddingTop: "12px",
-                      }}
+                      wrapperStyle={{ fontSize: "10px", color: "#71717a", paddingTop: "12px", fontFamily: "var(--font-geist-mono)", textTransform: "uppercase", letterSpacing: "0.08em" }}
                     />
                   </PieChart>
                 </ResponsiveContainer>
               </div>
 
-              {/* ── Model Comparison Bar Chart ────────────────────── */}
+              {/* ── Model Comparison ──────────────────────────────── */}
               <div
                 id="model-breakdown"
-                className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] p-6"
+                className="bg-zinc-900 p-5 rounded-none"
               >
-                <h2 className="text-sm font-semibold text-slate-300 mb-4 flex items-center gap-2">
-                  <Activity className="h-4 w-4 text-sky-400" />
+                <h2 className="font-mono text-[10px] font-semibold text-zinc-500 uppercase tracking-widest mb-4 flex items-center gap-2">
+                  <Activity className="h-3.5 w-3.5 text-orange-500" />
                   Model Comparison
                 </h2>
 
-                <ResponsiveContainer width="100%" height={260}>
+                <ResponsiveContainer width="100%" height={240}>
                   <BarChart
                     data={barChartData}
                     layout="vertical"
                     margin={{ top: 0, right: 12, bottom: 0, left: 0 }}
-                    barCategoryGap="28%"
+                    barCategoryGap="30%"
                   >
-                    <CartesianGrid
-                      strokeDasharray="3 3"
-                      stroke="#1e3a5f"
-                      horizontal={false}
-                    />
+                    <CartesianGrid strokeDasharray="2 4" stroke="#2a2a2e" horizontal={false} />
                     <XAxis
                       type="number"
                       allowDecimals={false}
-                      tick={{ fill: "#64748b", fontSize: 11 }}
+                      tick={{ fill: "#52525b", fontSize: 10, fontFamily: "var(--font-geist-mono)" }}
                       axisLine={false}
                       tickLine={false}
                     />
                     <YAxis
                       type="category"
                       dataKey="name"
-                      width={110}
-                      tick={{ fill: "#94a3b8", fontSize: 11 }}
+                      width={115}
+                      tick={{ fill: "#a1a1aa", fontSize: 10, fontFamily: "var(--font-geist-mono)" }}
                       axisLine={false}
                       tickLine={false}
                     />
-                    <Tooltip
-                      contentStyle={{
-                        backgroundColor: "#1e293b",
-                        border: "1px solid #334155",
-                        borderRadius: "12px",
-                        fontSize: "13px",
-                        color: "#e2e8f0",
-                      }}
-                      cursor={{ fill: "#ffffff08" }}
-                    />
-                    <Bar
-                      dataKey="flagged"
-                      radius={[0, 6, 6, 0]}
-                      maxBarSize={28}
-                    >
+                    <Tooltip contentStyle={TOOLTIP_STYLE} cursor={{ fill: "#ffffff06" }} />
+                    <Bar dataKey="flagged" radius={0} maxBarSize={24}>
                       {barChartData.map((entry, idx) => (
                         <Cell key={idx} fill={entry.fill} />
                       ))}
@@ -608,17 +557,13 @@ export default function HomePage() {
                   </BarChart>
                 </ResponsiveContainer>
 
-                {/* legend pills */}
-                <div className="flex flex-wrap gap-2 mt-3 justify-center">
+                <div className="flex flex-wrap gap-3 mt-2">
                   {barChartData.map((entry) => (
                     <span
                       key={entry.name}
-                      className="inline-flex items-center gap-1.5 text-[11px] text-slate-400"
+                      className="inline-flex items-center gap-1.5 font-mono text-[10px] text-zinc-500 uppercase"
                     >
-                      <span
-                        className="h-2 w-2 rounded-full"
-                        style={{ backgroundColor: entry.fill }}
-                      />
+                      <span className="h-1.5 w-1.5 rounded-none" style={{ backgroundColor: entry.fill }} />
                       {entry.name}: {entry.flagged}
                     </span>
                   ))}
@@ -628,73 +573,71 @@ export default function HomePage() {
               {/* ── Flagged Items List ────────────────────────────── */}
               <div
                 id="flagged-list"
-                className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] p-6 flex flex-col"
+                className="bg-zinc-900 p-5 flex flex-col rounded-none"
               >
                 <div className="flex items-center justify-between mb-4">
-                  <h2 className="text-sm font-semibold text-slate-300 flex items-center gap-2">
-                    <ShieldAlert className="h-4 w-4 text-rose-400" />
+                  <h2 className="font-mono text-[10px] font-semibold text-zinc-500 uppercase tracking-widest flex items-center gap-2">
+                    <ShieldAlert className="h-3.5 w-3.5 text-red-500" />
                     Flagged Items
-                    <span className="ml-1 rounded-full bg-rose-500/15 px-2 py-0.5 text-xs font-bold text-rose-400">
+                    <span className="ml-1 border border-red-500 bg-red-500/10 px-1.5 py-0.5 text-[9px] font-bold font-mono text-red-500 rounded-none">
                       {results.flagged_items.length}
                     </span>
                   </h2>
 
                   <div className="relative">
-                    <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-slate-500" />
+                    <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3 w-3 text-zinc-600" />
                     <input
                       id="filter-input"
                       type="text"
-                      placeholder="Filter…"
+                      placeholder="filter..."
                       value={filterQuery}
                       onChange={(e) => setFilterQuery(e.target.value)}
-                      className="w-36 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-light)] pl-8 pr-3 py-1.5 text-xs text-slate-300 placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-sky-500/50"
+                      className="w-32 border border-zinc-800 bg-zinc-950 pl-7 pr-3 py-1 font-mono text-[10px] text-zinc-400 placeholder-zinc-600 focus:outline-none focus:border-orange-500 rounded-none"
                     />
                   </div>
                 </div>
 
-                <div className="flex-1 overflow-y-auto max-h-80 space-y-1.5 pr-1">
+                <div className="flex-1 overflow-y-auto max-h-72 flex flex-col gap-px">
                   {filteredItems.length === 0 ? (
-                    <p className="text-sm text-slate-600 text-center py-8">
+                    <p className="font-mono text-[10px] text-zinc-600 text-center py-8 uppercase tracking-wider">
                       {results.flagged_items.length === 0
-                        ? "No anomalies detected — your dataset looks clean!"
+                        ? "No anomalies detected — dataset is clean."
                         : "No matches for this filter."}
                     </p>
                   ) : (
-                    filteredItems.map((item, idx) => {
-                      return (
-                        <div
-                          key={item.id}
-                          onClick={() => setSelectedItem(item)}
-                          className="flex items-center gap-2.5 rounded-lg bg-[var(--color-surface-light)] px-3 py-2.5 text-sm transition-colors cursor-pointer hover:bg-rose-500/10 group overflow-hidden"
-                        >
-                          <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded bg-rose-500/15 text-[9px] font-bold text-rose-400 group-hover:bg-rose-500/25">
-                            {idx + 1}
-                          </span>
-                          <span className="font-mono text-slate-300 truncate text-xs flex-1">
-                            {item.id}
-                          </span>
-                          <div className="flex items-center gap-1 shrink-0 flex-wrap justify-end">
-                            {item.flagged_by.map((model) => {
-                              const style = MODEL_COLORS[model] ?? DEFAULT_MODEL_STYLE;
-                              return (
-                                <span
-                                  key={model}
-                                  className={`rounded-full ${style.bg} px-1.5 py-0.5 text-[9px] font-semibold ${style.text} whitespace-nowrap`}
-                                >
-                                  {model}
-                                </span>
-                              );
-                            })}
-                            <button
-                              className="ml-2 text-slate-500 hover:text-cyan-400 transition-colors"
-                              title="Inspect Explanation"
-                            >
-                              <Search className="w-4 h-4" />
-                            </button>
-                          </div>
+                    filteredItems.map((item, idx) => (
+                      <div
+                        key={item.id}
+                        onClick={() => setSelectedItem(item)}
+                        className="flex items-center gap-2 bg-zinc-950 px-3 py-2 text-xs transition-none cursor-pointer hover:bg-orange-500/20 hover:border-l-2 hover:border-l-orange-500 group border-l-2 border-l-transparent rounded-none"
+                      >
+                        <span className="flex h-4 w-4 shrink-0 items-center justify-center border border-zinc-800 font-mono text-[8px] font-bold text-zinc-500 rounded-none">
+                          {idx + 1}
+                        </span>
+                        <span className="font-mono text-zinc-400 truncate text-[10px] flex-1">
+                          {item.id}
+                        </span>
+                        <div className="flex items-center gap-1 shrink-0 flex-wrap justify-end">
+                          {item.flagged_by.map((model) => {
+                            const style = MODEL_COLORS[model] ?? DEFAULT_MODEL_STYLE;
+                            return (
+                              <span
+                                key={model}
+                                className={`border border-current/20 ${style.bg} px-1 py-px font-mono text-[8px] font-semibold ${style.text} uppercase tracking-wide rounded-none`}
+                              >
+                                {model}
+                              </span>
+                            );
+                          })}
+                          <button
+                            className="ml-1 text-zinc-600 hover:text-orange-500 transition-none"
+                            title="Inspect Explanation"
+                          >
+                            <Search className="w-3.5 h-3.5" />
+                          </button>
                         </div>
-                      );
-                    })
+                      </div>
+                    ))
                   )}
                 </div>
               </div>
@@ -705,110 +648,117 @@ export default function HomePage() {
 
       {/* ── XAI Modal ─────────────────────────────────────────────── */}
       {selectedItem && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/80 backdrop-blur-sm p-4">
-          <div className="w-full max-w-3xl rounded-2xl border border-slate-700 bg-slate-800 shadow-2xl flex flex-col">
-            <div className="flex items-center justify-between border-b border-slate-700 p-4">
-              <h3 className="text-lg font-bold text-slate-200 flex items-center gap-2">
-                <Activity className="w-5 h-5 text-cyan-400" />
-                Explainable AI: <span className="font-mono text-sm text-slate-400">{selectedItem.id}</span>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/90 p-4">
+          <div className="w-full max-w-3xl border border-zinc-800 bg-zinc-900 flex flex-col rounded-none shadow-2xl">
+            {/* modal header */}
+            <div className="flex items-center justify-between border-b border-zinc-800 px-5 py-3 bg-zinc-950">
+              <h3 className="font-mono text-xs font-bold text-white uppercase tracking-widest flex items-center gap-2">
+                <Activity className="w-4 h-4 text-orange-500" />
+                XAI Report ·{" "}
+                <span className="text-zinc-500 font-normal">{selectedItem.id}</span>
               </h3>
-              <button 
-                onClick={() => setSelectedItem(null)} 
-                className="text-slate-400 hover:text-white transition-colors p-1"
+              <button
+                onClick={() => setSelectedItem(null)}
+                className="font-mono text-xs text-zinc-500 hover:text-white transition-none px-2 py-1 hover:bg-zinc-800 border border-transparent hover:border-zinc-700 rounded-none"
               >
-                ✕
+                [X] CLOSE
               </button>
             </div>
-            
+
             <div className="p-6 overflow-y-auto max-h-[80vh]">
+              {/* Image XAI */}
               {selectedItem.explanation?.type === "image" && (
                 <div className="w-full flex flex-col gap-4">
-                   <h4 className="text-sm text-slate-400 text-center font-mono font-semibold uppercase tracking-wider mb-2">Latent Space Divergence</h4>
-                   <p className="mt-0 mb-4 text-xs text-rose-300 bg-rose-500/10 p-3 rounded-lg border border-rose-500/20 text-center mx-auto shadow-inner leading-relaxed max-w-2xl">
-                     Showing the specific ResNet-18 neural features that mathematically alienated this image from the clean dataset.
-                   </p>
-                   {selectedItem.explanation?.error ? (
-                     <div className="flex flex-col items-center justify-center h-48 bg-rose-500/10 border border-rose-500/20 rounded-lg text-rose-400 p-6 text-center">
-                       <AlertTriangle className="w-8 h-8 mb-2 opacity-80" />
-                       <p className="font-mono text-sm">{selectedItem.explanation.error}</p>
-                     </div>
-                   ) : (
-                     <>
-                       <div className="h-64 w-full pl-6">
-                         <ResponsiveContainer width="100%" height="100%">
-                           <BarChart data={selectedItem.explanation.top_contributors} layout="vertical" margin={{ left: 80, right: 30, top: 0, bottom: 0 }}>
-                             <CartesianGrid strokeDasharray="3 3" stroke="#334155" horizontal={false} />
-                             <XAxis type="number" stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} />
-                             <YAxis type="category" dataKey="feature_index" tickFormatter={(val) => `Dim ${val}`} stroke="#cbd5e1" fontSize={11} tickLine={false} axisLine={false} width={100} />
-                             <Tooltip 
-                                cursor={{fill: '#ffffff05'}}
-                                contentStyle={{ backgroundColor: "#1e293b", borderColor: "#334155", color: "#fff", borderRadius: "8px", border: "1px solid #475569" }}
-                                formatter={(value: ValueType | undefined) => [Number(value ?? 0).toFixed(4), "Deviation"]}
-                                labelFormatter={(label) => `Feature Dimension ${label}`}
-                             />
-                             <Bar dataKey="deviation_score" fill="#c084fc" radius={[0, 4, 4, 0]} maxBarSize={30}>
-                               {selectedItem.explanation.top_contributors.map((_entry: ImageContributor, index: number) => (
-                                  <Cell key={`cell-${index}`} fill={index < 3 ? "#c084fc" : "#a855f7"} />
-                               ))}
-                             </Bar>
-                           </BarChart>
-                         </ResponsiveContainer>
-                       </div>
-                       <p className="mt-2 text-xs text-rose-300 bg-rose-500/10 p-3 rounded-lg border border-rose-500/20 text-center mx-auto shadow-inner leading-relaxed">
-                         Showing top 10 semantic dimensions that heavily deviate from the dataset's expected median.
-                       </p>
-                     </>
-                   )}
+                  <h4 className="font-mono text-[10px] text-zinc-500 uppercase tracking-widest border-l-2 border-orange-500 pl-2">
+                    LATENT SPACE DIVERGENCE — TOP DEVIANT FEATURES
+                  </h4>
+                  <p className="font-mono text-[10px] text-zinc-400 border border-red-500/20 bg-red-500/5 px-3 py-2 rounded-none">
+                    Specific ResNet-18 neural features that alienated this pattern.
+                  </p>
+                  {selectedItem.explanation?.error ? (
+                    <div className="flex flex-col items-center justify-center h-40 border border-red-500/30 text-red-500 font-mono text-xs p-4 rounded-none bg-zinc-950">
+                      <AlertTriangle className="w-6 h-6 mb-2 opacity-70" />
+                      {selectedItem.explanation.error}
+                    </div>
+                  ) : (
+                    <>
+                      <div className="h-64 w-full pl-4 bg-zinc-950 border border-zinc-800 p-2">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <BarChart
+                            data={selectedItem.explanation.top_contributors}
+                            layout="vertical"
+                            margin={{ left: 80, right: 30, top: 0, bottom: 0 }}
+                          >
+                            <CartesianGrid strokeDasharray="2 4" stroke="#2a2a2e" horizontal={false} />
+                            <XAxis type="number" stroke="#52525b" fontSize={10} tickLine={false} axisLine={false} style={{ fontFamily: "var(--font-geist-mono)" }} />
+                            <YAxis type="category" dataKey="feature_index" tickFormatter={(v) => `Dim ${v}`} stroke="#a1a1aa" fontSize={10} tickLine={false} axisLine={false} width={90} style={{ fontFamily: "var(--font-geist-mono)" }} />
+                            <Tooltip contentStyle={TOOLTIP_STYLE} cursor={{ fill: "#ffffff04" }} formatter={(value: ValueType | undefined) => [Number(value ?? 0).toFixed(4), "Deviation"]} labelFormatter={(label) => `Feature Dim ${label}`} />
+                            <Bar dataKey="deviation_score" fill="#f97316" radius={0} maxBarSize={28}>
+                              {selectedItem.explanation.top_contributors.map((_: ImageContributor, index: number) => (
+                                <Cell key={`cell-${index}`} fill={index < 3 ? "#f97316" : "#c2410c"} />
+                              ))}
+                            </Bar>
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </>
+                  )}
                 </div>
               )}
 
+              {/* Tabular XAI */}
               {selectedItem.explanation?.type === "tabular" && (
                 <div className="w-full flex flex-col gap-4">
-                   <h4 className="text-sm text-slate-400 text-center font-mono font-semibold uppercase tracking-wider mb-2">Top Anomaly Contributors</h4>
-                   <div className="h-64 w-full pl-6">
-                     <ResponsiveContainer width="100%" height="100%">
-                       <BarChart data={selectedItem.explanation.top_contributors} layout="vertical" margin={{ left: 80, right: 30, top: 0, bottom: 0 }}>
-                         <CartesianGrid strokeDasharray="3 3" stroke="#334155" horizontal={false} />
-                         <XAxis type="number" stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} />
-                         <YAxis type="category" dataKey="name" stroke="#cbd5e1" fontSize={11} tickLine={false} axisLine={false} width={100} />
-                         <Tooltip 
-                            cursor={{fill: '#ffffff05'}}
-                            contentStyle={{ backgroundColor: "#1e293b", borderColor: "#334155", color: "#fff", borderRadius: "8px", border: "1px solid #475569" }}
-                         />
-                         <Bar dataKey="error" fill="#f43f5e" radius={[0, 4, 4, 0]} maxBarSize={30}>
-                           {selectedItem.explanation.top_contributors.map((_entry: TabularContributor, index: number) => (
-                              <Cell key={`cell-${index}`} fill={index === 0 ? "#f43f5e" : index === 1 ? "#fb7185" : "#fda4af"} />
-                           ))}
-                         </Bar>
-                       </BarChart>
-                     </ResponsiveContainer>
-                   </div>
-                   <p className="mt-2 text-xs text-slate-500 text-center mx-auto">
-                     Showing the top 3 column features contributing to the absolute reconstruction error.
-                   </p>
+                  <h4 className="font-mono text-[10px] text-zinc-500 uppercase tracking-widest border-l-2 border-red-500 pl-2">
+                    RECONSTRUCTION ERROR — TOP ANOMALY CONTRIBUTORS
+                  </h4>
+                  <div className="h-64 w-full pl-4 bg-zinc-950 border border-zinc-800 p-2">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart
+                        data={selectedItem.explanation.top_contributors}
+                        layout="vertical"
+                        margin={{ left: 80, right: 30, top: 0, bottom: 0 }}
+                      >
+                        <CartesianGrid strokeDasharray="2 4" stroke="#2a2a2e" horizontal={false} />
+                        <XAxis type="number" stroke="#52525b" fontSize={10} tickLine={false} axisLine={false} style={{ fontFamily: "var(--font-geist-mono)" }} />
+                        <YAxis type="category" dataKey="name" stroke="#a1a1aa" fontSize={10} tickLine={false} axisLine={false} width={90} style={{ fontFamily: "var(--font-geist-mono)" }} />
+                        <Tooltip contentStyle={TOOLTIP_STYLE} cursor={{ fill: "#ffffff04" }} />
+                        <Bar dataKey="error" fill="#ef4444" radius={0} maxBarSize={28}>
+                          {selectedItem.explanation.top_contributors.map((_: TabularContributor, index: number) => (
+                            <Cell key={`cell-${index}`} fill={index === 0 ? "#ef4444" : index === 1 ? "#b91c1c" : "#7f1d1d"} />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <p className="font-mono text-[10px] text-zinc-600 text-center uppercase tracking-wider">
+                    Top 3 column features by absolute reconstruction error
+                  </p>
                 </div>
               )}
 
+              {/* Text / NLP XAI */}
               {selectedItem.explanation?.type === "text" && (
                 <div className="w-full flex flex-col gap-4">
-                   <h4 className="text-sm text-slate-400 text-center font-mono font-semibold uppercase tracking-wider mb-2">High Semantic Deviation</h4>
-                   <p className="text-xs text-sky-300 bg-sky-500/10 p-3 rounded-lg border border-sky-500/20 text-center mx-auto shadow-inner leading-relaxed max-w-2xl">
-                     This text snippet was flagged by the ensemble model for violating the expected semantic topography of the dataset.
-                   </p>
-                   <div className="relative mt-2 p-6 rounded-xl border border-slate-700 bg-[var(--color-surface-light)] shadow-sm max-w-2xl mx-auto w-full">
-                     <span className="absolute -top-3 left-4 bg-slate-800 text-xs font-mono font-bold text-slate-400 px-2 py-0.5 rounded border border-slate-700">
-                       Column: {selectedItem.explanation.column}
-                     </span>
-                     <blockquote className="text-slate-300 italic whitespace-pre-wrap text-sm border-l-4 border-cyan-500/50 pl-4 py-1">
-                       "{selectedItem.explanation.snippet}"
-                     </blockquote>
-                   </div>
+                  <h4 className="font-mono text-[10px] text-zinc-500 uppercase tracking-widest border-l-2 border-orange-500 pl-2">
+                    SEMANTIC DEVIATION — NLP ANOMALY
+                  </h4>
+                  <p className="font-mono text-[10px] text-zinc-400 border border-orange-500/20 bg-orange-500/5 px-3 py-2 rounded-none">
+                    Text snippet violated expected semantic topography.
+                  </p>
+                  <div className="relative border border-zinc-800 bg-zinc-950 p-5 max-w-2xl w-full rounded-none">
+                    <span className="absolute -top-px left-4 bg-zinc-900 border border-zinc-800 border-t-0 font-mono text-[9px] font-bold text-orange-500 px-2 uppercase tracking-widest rounded-none">
+                      col: {selectedItem.explanation.column}
+                    </span>
+                    <blockquote className="font-mono text-sm text-zinc-400 whitespace-pre-wrap border-l-2 border-orange-500 pl-4 py-1 italic bg-zinc-900/50 p-2">
+                      &ldquo;{selectedItem.explanation.snippet}&rdquo;
+                    </blockquote>
+                  </div>
                 </div>
               )}
 
               {!selectedItem.explanation && (
-                <div className="text-slate-400 text-center py-12 flex flex-col items-center gap-3">
-                  <Activity className="w-8 h-8 text-slate-600 animate-pulse" />
+                <div className="font-mono text-[10px] text-zinc-600 text-center py-10 uppercase tracking-widest border border-dashed border-zinc-800 bg-zinc-950">
                   No explanation payload available for this item.
                 </div>
               )}
@@ -818,10 +768,10 @@ export default function HomePage() {
       )}
 
       {/* ── Footer ────────────────────────────────────────────────── */}
-      <footer className="mt-auto border-t border-[var(--color-border)] bg-[var(--color-surface)]/60 backdrop-blur-sm">
-        <div className="mx-auto max-w-7xl px-6 py-4 flex items-center justify-between text-xs text-slate-600">
-          <span>AICS Universal Sanitizer v0.2.0</span>
-          <span>Autoencoder · Deep&nbsp;SVDD · Isolation&nbsp;Forest</span>
+      <footer className="mt-auto border-t border-zinc-800 bg-zinc-950">
+        <div className="mx-auto max-w-7xl px-6 py-3 flex items-center justify-between font-mono text-[10px] text-zinc-600 uppercase tracking-widest">
+          <span>Distill v0.2.0</span>
+          <span>Autoencoder · Deep SVDD · Isolation Forest</span>
         </div>
       </footer>
     </main>
@@ -843,34 +793,24 @@ function MetricCard({
   icon: React.ReactNode;
   label: string;
   value: string;
-  accent: "sky" | "rose";
+  accent: "neutral" | "danger";
   large?: boolean;
 }) {
-  const ring =
-    accent === "sky"
-      ? "ring-sky-500/20 text-sky-400"
-      : "ring-rose-500/20 text-rose-400";
-  const iconBg =
-    accent === "sky" ? "bg-sky-500/10" : "bg-rose-500/10";
-  const valColor =
-    accent === "sky" ? "text-cyan-300" : "text-rose-300";
+  const valColor = accent === "danger" ? "text-red-500" : "text-white";
+  const iconColor = accent === "danger" ? "text-red-500" : "text-zinc-500";
 
   return (
     <div
       id={id}
-      className={`rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] p-6 ring-1 ${ring} transition-shadow hover:shadow-lg hover:shadow-sky-500/5`}
+      className="bg-zinc-900 p-5 hover:bg-zinc-800 transition-none rounded-none"
     >
-      <div className="flex items-center gap-2 text-slate-400 mb-3">
-        <span className={`rounded-lg p-1.5 ${iconBg}`}>{icon}</span>
-        <span className="text-xs font-medium uppercase tracking-wider">
+      <div className={`flex items-center gap-1.5 mb-3 ${iconColor}`}>
+        {icon}
+        <span className="font-mono text-[10px] font-medium uppercase tracking-widest text-zinc-500">
           {label}
         </span>
       </div>
-      <p
-        className={`${
-          large ? "text-5xl" : "text-3xl"
-        } font-extrabold tracking-tight ${valColor}`}
-      >
+      <p className={`font-mono font-extrabold tracking-tight ${valColor} ${large ? "text-5xl" : "text-3xl"}`}>
         {value}
       </p>
     </div>
