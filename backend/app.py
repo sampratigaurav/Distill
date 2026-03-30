@@ -15,6 +15,7 @@ import uuid
 import json
 import os
 import random
+import time
 from fpdf import FPDF
 import shutil
 import zipfile
@@ -115,9 +116,9 @@ app.add_middleware(
 extractor = UniversalExtractor()
 
 # Training hyper-parameters
-EPOCHS = 20
+EPOCHS = 5
 LEARNING_RATE = 1e-3
-BATCH_SIZE = 64
+BATCH_SIZE = 2048
 MAD_THRESHOLD = 4.5
 
 # Device selection — use the T4 GPU when available, fall back to CPU.
@@ -193,12 +194,14 @@ def _evaluate_autoencoder(model: DynamicAutoencoder, eval_tensor: torch.Tensor) 
     
     all_recons = []
     all_errors = []
-    
+    _autocast_device = "cuda" if torch.cuda.is_available() else "cpu"
+
     with torch.no_grad():
-        for (batch,) in eval_loader:
-            batch_dev = batch.to(device)
-            all_recons.append(model(batch_dev).cpu().numpy())
-            all_errors.append(model.reconstruction_error(batch_dev).cpu().numpy())
+        with torch.autocast(device_type=_autocast_device):
+            for (batch,) in eval_loader:
+                batch_dev = batch.to(device)
+                all_recons.append(model(batch_dev).cpu().float().numpy())
+                all_errors.append(model.reconstruction_error(batch_dev).cpu().float().numpy())
             
     reconstructions = np.concatenate(all_recons, axis=0)
     errors = np.concatenate(all_errors, axis=0)
@@ -262,10 +265,13 @@ def _evaluate_deep_svdd(model: DynamicDeepSVDD, eval_tensor: torch.Tensor) -> np
     )
     
     all_distances = []
+    _autocast_device = "cuda" if torch.cuda.is_available() else "cpu"
+
     with torch.no_grad():
-        for (batch,) in eval_loader:
-            batch_dev = batch.to(device)
-            all_distances.append(model.anomaly_score(batch_dev).cpu().numpy())
+        with torch.autocast(device_type=_autocast_device):
+            for (batch,) in eval_loader:
+                batch_dev = batch.to(device)
+                all_distances.append(model.anomaly_score(batch_dev).cpu().float().numpy())
             
     distances = np.concatenate(all_distances, axis=0)
     return distances
@@ -444,8 +450,20 @@ async def scan_dataset(request: Request, file: UploadFile = File(...)):
             # Re-inject Chunk 0 into the evaluation pipeline seamlessly
             import itertools
             full_stream = itertools.chain([(first_features, first_identifiers)], data_stream)
-            
+
+            # Circuit breaker: abort streaming after 45 seconds
+            _SCAN_TIMEOUT = 45.0
+            start_time = time.time()
+
             for features, identifiers in full_stream:
+                # --- Circuit Breaker ---
+                if time.time() - start_time > _SCAN_TIMEOUT:
+                    print(
+                        f"[Distill] Circuit breaker tripped after {_SCAN_TIMEOUT}s. "
+                        f"Processed {total_samples} samples before cutoff."
+                    )
+                    break
+
                 chunk_len = len(features)
                 total_samples += chunk_len
                 
