@@ -347,14 +347,17 @@ def _build_flagged_items(
 ) -> list[dict]:
     """
     Build the enriched flagged-items list.
-
     A sample is poisoned IF AND ONLY IF total_votes >= 2.
     """
     model_names = [MODEL_AE, MODEL_SVDD, MODEL_ISO]
     items: list[dict] = []
 
-    for i, ident in enumerate(identifiers):
-        flags = [ae_flags[i], svdd_flags[i], iso_flags[i]]
+    # DEFENSIVE ITERATION: zip() safely binds the loop to the shortest array,
+    # preventing out-of-bounds errors if the identifiers list grows too large.
+    for ident, ae_f, svdd_f, iso_f, orig_f, recon_f in zip(
+        identifiers, ae_flags, svdd_flags, iso_flags, feature_vectors, reconstructions
+    ):
+        flags = [ae_f, svdd_f, iso_f]
         
         total_votes = sum(flags)
         is_poisoned = bool(total_votes >= 2)
@@ -362,7 +365,7 @@ def _build_flagged_items(
             continue
             
         flagged_by = [name for name, f in zip(model_names, flags) if f]
-        explanation = _generate_xai_payload(ident, feature_vectors[i], reconstructions[i], median_vector)
+        explanation = _generate_xai_payload(ident, orig_f, recon_f, median_vector)
         
         items.append({
             "id": ident, 
