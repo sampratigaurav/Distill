@@ -31,6 +31,11 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 _CSV_EXTENSIONS = {".csv"}
 
+# Maximum number of rows processed by the tabular pipeline.
+# Datasets larger than this are randomly down-sampled before feature
+# extraction to keep training times in the single-digit-second range.
+MAX_SAMPLE_SIZE = 10000
+
 
 def _file_ext(name: str) -> str:
     """Return the lowercase extension including the leading dot."""
@@ -108,7 +113,11 @@ class UniversalExtractor:
         """Impute, scale & encode a DataFrame. Returns features + identifiers."""
         self.last_images.clear()
         self.last_columns.clear()
-        
+
+        # Down-sample large datasets to keep training times bounded.
+        if len(df) > MAX_SAMPLE_SIZE:
+            df = df.sample(n=MAX_SAMPLE_SIZE, random_state=42).reset_index(drop=True)
+
         num_cols = df.select_dtypes(include="number").columns.tolist()
         cat_cols = df.select_dtypes(exclude="number").columns.tolist()
 
