@@ -89,8 +89,8 @@ def get_binary_votes(raw_scores: np.ndarray, n_samples: int) -> np.ndarray:
 
 def _train_autoencoder(
     tensor_data: torch.Tensor, input_dim: int
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Train a DynamicAutoencoder with Early Stopping; return (raw_scores, mad_flags, reconstructions)."""
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Train a DynamicAutoencoder with Early Stopping; return (raw_scores, reconstructions)."""
     model = DynamicAutoencoder(input_dim)
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -277,7 +277,6 @@ async def scan_dataset(request: Request, file: UploadFile = File(...)):
         raise HTTPException(status_code=413, detail="Dataset exceeds 1GB limit.")
 
     try:
-        import random
         torch.manual_seed(42)
         np.random.seed(42)
         random.seed(42)
@@ -341,7 +340,6 @@ async def download_sanitized(
     try:
         to_remove: list[str] = json.loads(flagged_items)
     except (json.JSONDecodeError, TypeError):
-        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="flagged_items must be valid JSON.")
 
     remove_set = set(to_remove)
@@ -369,18 +367,18 @@ async def download_sanitized(
 
     # ── ZIP path ──────────────────────────────────────────────────────
     if filename.endswith(".zip"):
-        src = zipfile.ZipFile(io.BytesIO(raw))
-        out_buf = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(raw)) as src:
+            out_buf = io.BytesIO()
 
-        with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as dst:
-            for entry in src.namelist():
-                # Skip directories, macOS junk, and flagged files
-                if entry.endswith("/") or entry.startswith("__MACOSX"):
-                    continue
-                basename = entry.split("/")[-1]
-                if basename in remove_set:
-                    continue
-                dst.writestr(entry, src.read(entry))
+            with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as dst:
+                for entry in src.namelist():
+                    # Skip directories, macOS junk, and flagged files
+                    if entry.endswith("/") or entry.startswith("__MACOSX"):
+                        continue
+                    basename = entry.split("/")[-1]
+                    if basename in remove_set:
+                        continue
+                    dst.writestr(entry, src.read(entry))
 
         out_buf.seek(0)
 
@@ -392,7 +390,6 @@ async def download_sanitized(
             },
         )
 
-    from fastapi import HTTPException
     raise HTTPException(status_code=400, detail="Unsupported file type.")
 
 
