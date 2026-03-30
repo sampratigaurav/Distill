@@ -76,6 +76,9 @@ LEARNING_RATE = 1e-3
 BATCH_SIZE = 64
 MAD_THRESHOLD = 4.5
 
+# Device selection — use the T4 GPU when available, fall back to CPU.
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 # Model display names (used in the response payload)
 MODEL_AE = "Autoencoder"
 MODEL_SVDD = "Deep SVDD"
@@ -101,7 +104,7 @@ def _train_autoencoder(
     tensor_data: torch.Tensor, input_dim: int
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Train a DynamicAutoencoder with Early Stopping; return (raw_scores, reconstructions)."""
-    model = DynamicAutoencoder(input_dim)
+    model = DynamicAutoencoder(input_dim).to(device)
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.MSELoss()
@@ -116,6 +119,7 @@ def _train_autoencoder(
     for _ in range(EPOCHS):
         epoch_loss = 0.0
         for (batch,) in loader:
+            batch = batch.to(device)
             optimizer.zero_grad()
             recon = model(batch)
             loss = criterion(recon, batch)
@@ -133,9 +137,10 @@ def _train_autoencoder(
                 break
 
     model.eval()
+    tensor_data_dev = tensor_data.to(device)
     with torch.no_grad():
-        reconstructions = model(tensor_data).numpy()
-        errors = model.reconstruction_error(tensor_data).numpy()
+        reconstructions = model(tensor_data_dev).cpu().numpy()
+        errors = model.reconstruction_error(tensor_data_dev).cpu().numpy()
 
     return errors, reconstructions
 
@@ -144,12 +149,13 @@ def _train_deep_svdd(
     tensor_data: torch.Tensor, input_dim: int
 ) -> np.ndarray:
     """Train a DynamicDeepSVDD with Early Stopping; return raw_scores."""
-    model = DynamicDeepSVDD(input_dim)
+    model = DynamicDeepSVDD(input_dim).to(device)
+    tensor_data_dev = tensor_data.to(device)
 
     # Initialize center c
     model.eval()
     with torch.no_grad():
-        initial_out = model(tensor_data)
+        initial_out = model(tensor_data_dev)
         model.center.copy_(initial_out.mean(dim=0))
 
     model.train()
@@ -165,6 +171,7 @@ def _train_deep_svdd(
     for _ in range(EPOCHS):
         epoch_loss = 0.0
         for (batch,) in loader:
+            batch = batch.to(device)
             optimizer.zero_grad()
             output = model(batch)
             loss = torch.mean(torch.sum((output - model.center) ** 2, dim=1))
@@ -183,7 +190,7 @@ def _train_deep_svdd(
 
     model.eval()
     with torch.no_grad():
-        distances = model.anomaly_score(tensor_data).numpy()
+        distances = model.anomaly_score(tensor_data_dev).cpu().numpy()
 
     return distances
 
@@ -463,9 +470,9 @@ distill_image = (
 
 # 4. Define the serverless function (no 'mounts' parameter needed here anymore)
 @modal_app.function(
-    image=distill_image, 
-    memory=4096, 
-    cpu=2.0
+    image=distill_image,
+    gpu="T4",
+    memory=8192,
 )
 @modal.asgi_app()
 def serve():
