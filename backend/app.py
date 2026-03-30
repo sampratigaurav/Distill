@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import random
+import shutil
 import zipfile
 from typing import List, Tuple
 
@@ -24,6 +26,9 @@ from fastapi import FastAPI, File, Form, UploadFile, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sklearn.ensemble import IsolationForest
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 from torch.utils.data import DataLoader, TensorDataset
 
 from extractor import UniversalExtractor
@@ -49,9 +54,14 @@ app = FastAPI(
     version="0.2.0",
 )
 
+# Rate limiter (5 requests / minute per IP on heavy endpoints)
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://distill-nine-theta.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -266,7 +276,19 @@ async def health():
     return {"status": "healthy", "version": app.version}
 
 
+# Temp uploads directory used in the Modal container
+_TEMP_UPLOADS_DIR = "/root/temp_uploads"
+
+
+def _purge_temp_uploads() -> None:
+    """Securely delete all contents of the temp uploads directory."""
+    if os.path.isdir(_TEMP_UPLOADS_DIR):
+        shutil.rmtree(_TEMP_UPLOADS_DIR, ignore_errors=True)
+    os.makedirs(_TEMP_UPLOADS_DIR, exist_ok=True)
+
+
 @app.post("/scan-dataset")
+@limiter.limit("5/minute")
 async def scan_dataset(request: Request, file: UploadFile = File(...)):
     """
     Upload a CSV or ZIP, run an ensemble of three anomaly detectors,
@@ -321,9 +343,12 @@ async def scan_dataset(request: Request, file: UploadFile = File(...)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+    finally:
+        _purge_temp_uploads()
 
 
 @app.post("/download-sanitized")
+@limiter.limit("5/minute")
 async def download_sanitized(
     request: Request,
     file: UploadFile = File(...),
@@ -346,58 +371,62 @@ async def download_sanitized(
     filename = (file.filename or "").lower()
     raw = await file.read()
 
-    # ── CSV path ──────────────────────────────────────────────────────
-    if filename.endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(raw))
-        # Row indices were stringified in the scan response
-        mask = ~df.index.astype(str).isin(remove_set)
-        clean_df = df.loc[mask]
+    try:
+        # ── CSV path ──────────────────────────────────────────────────────
+        if filename.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(raw))
+            # Row indices were stringified in the scan response
+            mask = ~df.index.astype(str).isin(remove_set)
+            clean_df = df.loc[mask]
 
-        buf = io.StringIO()
-        clean_df.to_csv(buf, index=False)
-        buf.seek(0)
+            buf = io.StringIO()
+            clean_df.to_csv(buf, index=False)
+            buf.seek(0)
 
-        return StreamingResponse(
-            iter([buf.getvalue()]),
-            media_type="text/csv",
-            headers={
-                "Content-Disposition": "attachment; filename=sanitized_data.csv"
-            },
-        )
+            return StreamingResponse(
+                iter([buf.getvalue()]),
+                media_type="text/csv",
+                headers={
+                    "Content-Disposition": "attachment; filename=sanitized_data.csv"
+                },
+            )
 
-    # ── ZIP path ──────────────────────────────────────────────────────
-    if filename.endswith(".zip"):
-        with zipfile.ZipFile(io.BytesIO(raw)) as src:
-            out_buf = io.BytesIO()
+        # ── ZIP path ──────────────────────────────────────────────────────
+        if filename.endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(raw)) as src:
+                out_buf = io.BytesIO()
 
-            with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as dst:
-                for entry in src.namelist():
-                    # Skip directories, macOS junk, and flagged files
-                    if entry.endswith("/") or entry.startswith("__MACOSX"):
-                        continue
-                    basename = entry.split("/")[-1]
-                    if basename in remove_set:
-                        continue
-                    dst.writestr(entry, src.read(entry))
+                with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as dst:
+                    for entry in src.namelist():
+                        # Skip directories, macOS junk, and flagged files
+                        if entry.endswith("/") or entry.startswith("__MACOSX"):
+                            continue
+                        basename = os.path.basename(entry)
+                        if basename in remove_set:
+                            continue
+                        # Write using the sanitized basename to prevent path traversal
+                        # in the output archive.
+                        dst.writestr(basename, src.read(entry))
 
-        out_buf.seek(0)
+            out_buf.seek(0)
 
-        return StreamingResponse(
-            out_buf,
-            media_type="application/zip",
-            headers={
-                "Content-Disposition": "attachment; filename=sanitized_data.zip"
-            },
-        )
+            return StreamingResponse(
+                out_buf,
+                media_type="application/zip",
+                headers={
+                    "Content-Disposition": "attachment; filename=sanitized_data.zip"
+                },
+            )
 
-    raise HTTPException(status_code=400, detail="Unsupported file type.")
+        raise HTTPException(status_code=400, detail="Unsupported file type.")
+    finally:
+        _purge_temp_uploads()
 
 
 # ==========================================
 # MODAL SERVERLESS DEPLOYMENT CONFIGURATION
 # ==========================================
 import modal
-import os
 
 # 1. Define the Modal Application
 modal_app = modal.App("distill-backend")
@@ -420,7 +449,8 @@ distill_image = (
         "pandas", 
         "numpy", 
         "opencv-python-headless", 
-        "pillow"
+        "pillow",
+        "slowapi",
     )
     # NEW MODAL 1.0 SYNTAX: Add local files directly to the image builder
     .add_local_file(
@@ -439,8 +469,6 @@ distill_image = (
 )
 @modal.asgi_app()
 def serve():
-    # Ensure the upload directory exists in the cloud container
-    if not os.path.exists("/root/temp_uploads"):
-        os.makedirs("/root/temp_uploads")
-        
+    # Ensure the upload directory starts clean in the cloud container
+    _purge_temp_uploads()
     return app

@@ -297,6 +297,14 @@ export default function HomePage() {
           </button>
         </div>
 
+        {/* ── Privacy Guarantee Badge ──────────────────────────── */}
+        <div className="flex justify-center">
+          <span className="inline-flex items-center gap-2 rounded-full bg-emerald-500/10 px-4 py-1.5 text-xs font-medium text-emerald-400 ring-1 ring-emerald-500/20">
+            <ShieldCheck className="h-3.5 w-3.5" />
+            Data is processed in memory and immediately destroyed.
+          </span>
+        </div>
+
         {/* ── Error ──────────────────────────────────────────────── */}
         {error && (
           <div
