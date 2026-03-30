@@ -59,9 +59,20 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# Parse allowed origins from environment or use defaults
+allowed_origins_env = os.getenv("ALLOWED_ORIGINS")
+if allowed_origins_env:
+    origins = [orig.strip() for orig in allowed_origins_env.split(",") if orig.strip()]
+else:
+    origins = [
+        "https://distill-nine-theta.vercel.app",
+        "http://localhost:3000",
+        "http://localhost:3001",
+    ]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://distill-nine-theta.vercel.app"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -284,7 +295,7 @@ async def health():
 
 
 # Temp uploads directory used in the Modal container
-_TEMP_UPLOADS_DIR = "/root/temp_uploads"
+_TEMP_UPLOADS_DIR = os.getenv('TEMP_UPLOADS_DIR', os.path.join(os.getcwd(), 'temp_uploads'))
 
 
 def _purge_temp_uploads() -> None:
@@ -466,6 +477,8 @@ distill_image = (
         "pillow",
         "slowapi",
     )
+    # Cache the 44MB ResNet-18 weights during image build to prevent cold-start latency
+    .run_commands('python -c "from torchvision.models import resnet18, ResNet18_Weights; resnet18(weights=ResNet18_Weights.DEFAULT)"')
     # NEW MODAL 1.0 SYNTAX: Add local files directly to the image builder
     .add_local_file(
         os.path.join(backend_dir, "extractor.py"), remote_path="/root/extractor.py"

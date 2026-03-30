@@ -133,12 +133,14 @@ class UniversalExtractor:
 
         # --- Categorical columns ---
         if cat_cols:
-            cat_df = df[cat_cols].copy()
+            cat_dict = {}
             for col in cat_cols:
-                mode_val = cat_df[col].mode()
-                cat_df[col] = cat_df[col].fillna(
-                    mode_val.iloc[0] if not mode_val.empty else "MISSING"
-                )
+                col_series = df[col]
+                mode_val = col_series.mode()
+                fill_val = mode_val.iloc[0] if not mode_val.empty else "MISSING"
+                cat_dict[col] = col_series.fillna(fill_val)
+                
+            cat_df = pd.DataFrame(cat_dict)
             encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
             parts.append(encoder.fit_transform(cat_df.values))
             self.last_columns.extend(list(encoder.get_feature_names_out(cat_cols)))
@@ -213,8 +215,8 @@ class UniversalExtractor:
         """Read every CSV inside the archive, concat, and run the tabular pipeline."""
         frames: list[pd.DataFrame] = []
         for entry in csv_entries:
-            csv_bytes = archive.read(entry)
-            df = pd.read_csv(io.BytesIO(csv_bytes))
+            with archive.open(entry) as f:
+                df = pd.read_csv(f)
             # Tag rows with the source filename (sanitized to prevent path traversal)
             basename = os.path.basename(entry)
             df.index = pd.RangeIndex(len(df))

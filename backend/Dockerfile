@@ -1,5 +1,5 @@
-# Use a lightweight Python 3.9 image
-FROM python:3.9-slim
+# Use a lightweight Python 3.11 image
+FROM python:3.11-slim
 
 # Set the working directory
 WORKDIR /app
@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Create a temporary uploads folder and give it read/write permissions
+ENV TEMP_UPLOADS_DIR=/app/temp_uploads
 RUN mkdir -p temp_uploads && chmod 777 temp_uploads
 
 # Expose the default Hugging Face port
