@@ -74,7 +74,7 @@ class TestGetBinaryVotes:
         flags = get_binary_votes(scores, n_samples=45)
         assert len(flags) == 45
 
-    def test_stricter_threshold_for_small_dataset(self):
+    def test_sensitive_threshold_for_small_dataset(self):
         """
         n_samples < 100 uses threshold 4.0; n_samples >= 100 uses 3.5.
         An outlier with a mod-z-score between 3.5 and 4.0 should be caught
@@ -104,7 +104,7 @@ class TestGetBinaryVotes:
         flags_small = get_binary_votes(base_small, n_samples=50)   # threshold 4.0
 
         assert flags_large[0] == 1, "outlier should be flagged with large-dataset threshold 3.5"
-        assert flags_small[0] == 0, "outlier should not be flagged with small-dataset threshold 4.0"
+        assert flags_small[0] == 1, "outlier should be flagged with the new small-dataset threshold of 2.0"
 
     def test_mad_epsilon_floor_prevents_zero_division(self):
         """Near-uniform data must not raise a ZeroDivisionError."""
