@@ -13,6 +13,7 @@ ZIP handling is content-aware:
 from __future__ import annotations
 
 import io
+import os
 import zipfile
 from typing import List, Tuple
 
@@ -158,6 +159,16 @@ class UniversalExtractor:
         raw = await file.read()
         archive = zipfile.ZipFile(io.BytesIO(raw))
 
+        # --- Zip bomb protection: reject archives whose total uncompressed
+        #     size exceeds 1 GB before extracting any content. ---
+        _MAX_UNCOMPRESSED = 1 * 1024 * 1024 * 1024  # 1 GB
+        total_uncompressed = sum(info.file_size for info in archive.infolist())
+        if total_uncompressed > _MAX_UNCOMPRESSED:
+            raise HTTPException(
+                status_code=413,
+                detail="ZIP archive uncompressed size exceeds the 1 GB limit.",
+            )
+
         # Classify entries
         csv_entries: list[str] = []
         img_entries: list[str] = []
@@ -195,8 +206,8 @@ class UniversalExtractor:
         for entry in csv_entries:
             csv_bytes = archive.read(entry)
             df = pd.read_csv(io.BytesIO(csv_bytes))
-            # Tag rows with the source filename
-            basename = entry.split("/")[-1]
+            # Tag rows with the source filename (sanitized to prevent path traversal)
+            basename = os.path.basename(entry)
             df.index = pd.RangeIndex(len(df))
             df["__source_file__"] = basename
             frames.append(df)
@@ -247,7 +258,8 @@ class UniversalExtractor:
             img_bytes = archive.read(entry)
             img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
             
-            filename = entry.split("/")[-1]
+            # Sanitize filename to prevent path traversal
+            filename = os.path.basename(entry)
             self.last_images[filename] = img.copy()
             
             tensor = self._transform(img)  # type: ignore[misc]
