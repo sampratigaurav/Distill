@@ -2,7 +2,7 @@
 Unit tests for the core mathematical logic in Distill.
 
 Covers:
-  - MAD-based thresholding  (get_binary_votes)
+  - MAD-based thresholding  (_calibrate_mad_threshold + _evaluate_binary_votes)
   - Isolation-Forest contamination formula
   - DynamicAutoencoder forward pass & reconstruction error
   - DynamicDeepSVDD forward pass & anomaly score
@@ -24,27 +24,33 @@ _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-from app import get_binary_votes, _build_flagged_items  # noqa: E402
+from app import _calibrate_mad_threshold, _evaluate_binary_votes, _build_flagged_items  # noqa: E402
 from models import DynamicAutoencoder, DynamicDeepSVDD  # noqa: E402
 
 
+def _votes(scores: np.ndarray, n_samples: int) -> np.ndarray:
+    """Test helper: calibrate MAD thresholds and evaluate in one call."""
+    median, mad, threshold = _calibrate_mad_threshold(scores, n_samples)
+    return _evaluate_binary_votes(scores, median, mad, threshold)
+
+
 # ---------------------------------------------------------------------------
-# get_binary_votes — MAD-based Modified Z-Score thresholding
+# _evaluate_binary_votes — MAD-based Modified Z-Score thresholding
 # ---------------------------------------------------------------------------
 
-class TestGetBinaryVotes:
+class TestEvaluateBinaryVotes:
     def test_no_outliers_flags_nothing(self):
         """Tightly-clustered data should produce zero flags."""
         rng = np.random.default_rng(0)
         scores = rng.normal(loc=1.0, scale=0.01, size=60).astype(np.float32)
-        flags = get_binary_votes(scores, n_samples=60)
+        flags = _votes(scores, n_samples=60)
         assert flags.sum() == 0
 
     def test_single_extreme_outlier_is_flagged(self):
         """One extreme value must be flagged while the rest are clean."""
         scores = np.ones(60, dtype=np.float32) * 0.5
         scores[0] = 500.0  # blatant outlier
-        flags = get_binary_votes(scores, n_samples=60)
+        flags = _votes(scores, n_samples=60)
         assert flags[0] == 1, "extreme outlier should be flagged"
         assert flags[1:].sum() == 0, "clean samples should not be flagged"
 
@@ -52,26 +58,26 @@ class TestGetBinaryVotes:
         """Multiple extreme values must all be flagged."""
         scores = np.ones(80, dtype=np.float32) * 0.3
         scores[[5, 20, 50]] = 999.0
-        flags = get_binary_votes(scores, n_samples=80)
+        flags = _votes(scores, n_samples=80)
         assert flags[5] == 1 and flags[20] == 1 and flags[50] == 1
 
     def test_uniform_data_flags_nothing(self):
         """Perfectly uniform scores have zero MAD -> epsilon floor prevents false flags."""
         scores = np.full(30, 7.0, dtype=np.float32)
-        flags = get_binary_votes(scores, n_samples=30)
+        flags = _votes(scores, n_samples=30)
         assert flags.sum() == 0
 
     def test_output_is_binary(self):
         """All flag values must be exactly 0 or 1."""
         rng = np.random.default_rng(1)
         scores = rng.random(50).astype(np.float32)
-        flags = get_binary_votes(scores, n_samples=50)
+        flags = _votes(scores, n_samples=50)
         assert set(flags.tolist()).issubset({0, 1})
 
     def test_output_length_matches_input(self):
         """Output array length must equal input array length."""
         scores = np.random.rand(45).astype(np.float32)
-        flags = get_binary_votes(scores, n_samples=45)
+        flags = _votes(scores, n_samples=45)
         assert len(flags) == 45
 
     def test_sensitive_threshold_for_small_dataset(self):
@@ -100,18 +106,18 @@ class TestGetBinaryVotes:
         base_small = np.zeros(50, dtype=np.float32)
         base_small[0] = outlier_val
 
-        flags_large = get_binary_votes(base_large, n_samples=150)  # threshold 3.5
-        flags_small = get_binary_votes(base_small, n_samples=50)   # threshold 4.0
+        flags_large = _votes(base_large, n_samples=150)  # threshold 3.5
+        flags_small = _votes(base_small, n_samples=50)   # threshold 3.0
 
         assert flags_large[0] == 1, "outlier should be flagged with large-dataset threshold 3.5"
-        assert flags_small[0] == 1, "outlier should be flagged with the new small-dataset threshold of 2.0"
+        assert flags_small[0] == 1, "outlier should be flagged with the small-dataset threshold of 3.0"
 
     def test_mad_epsilon_floor_prevents_zero_division(self):
         """Near-uniform data must not raise a ZeroDivisionError."""
         scores = np.full(25, 3.14159, dtype=np.float32)
         scores[0] += 1e-10  # tiny perturbation — still near-uniform
         # Should complete without exception
-        flags = get_binary_votes(scores, n_samples=25)
+        flags = _votes(scores, n_samples=25)
         assert isinstance(flags, np.ndarray)
 
 
