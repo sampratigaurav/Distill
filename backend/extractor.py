@@ -116,7 +116,7 @@ class UniversalExtractor:
         # --- Numerical columns ---
         if num_cols:
             num_df = df[num_cols].copy()
-            num_df.fillna(num_df.mean(), inplace=True)
+            num_df = num_df.fillna(num_df.mean())
             scaler = StandardScaler()
             parts.append(scaler.fit_transform(num_df.values))
             self.last_columns.extend(num_cols)
@@ -126,9 +126,8 @@ class UniversalExtractor:
             cat_df = df[cat_cols].copy()
             for col in cat_cols:
                 mode_val = cat_df[col].mode()
-                cat_df[col].fillna(
-                    mode_val.iloc[0] if not mode_val.empty else "MISSING",
-                    inplace=True,
+                cat_df[col] = cat_df[col].fillna(
+                    mode_val.iloc[0] if not mode_val.empty else "MISSING"
                 )
             encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
             parts.append(encoder.fit_transform(cat_df.values))

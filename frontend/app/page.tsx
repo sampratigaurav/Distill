@@ -29,14 +29,29 @@ import {
   YAxis,
   CartesianGrid,
 } from "recharts";
+import type { ValueType } from "recharts/types/component/DefaultTooltipContent";
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
 /* ------------------------------------------------------------------ */
+interface ImageContributor {
+  feature_index: number;
+  deviation_score: number;
+}
+
+interface TabularContributor {
+  name: string;
+  error: number;
+}
+
+type Explanation =
+  | { type: "image"; top_contributors: ImageContributor[]; error?: string }
+  | { type: "tabular"; top_contributors: TabularContributor[] };
+
 interface FlaggedItem {
   id: string;
   flagged_by: string[];
-  explanation?: any;
+  explanation?: Explanation;
 }
 
 interface ScanResults {
@@ -569,15 +584,15 @@ export default function HomePage() {
                         : "No matches for this filter."}
                     </p>
                   ) : (
-                    filteredItems.map((item, i) => {
+                    filteredItems.map((item, idx) => {
                       return (
                         <div
-                          key={i}
+                          key={item.id}
                           onClick={() => setSelectedItem(item)}
                           className="flex items-center gap-2.5 rounded-lg bg-[var(--color-surface-light)] px-3 py-2.5 text-sm transition-colors cursor-pointer hover:bg-rose-500/10 group overflow-hidden"
                         >
                           <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded bg-rose-500/15 text-[9px] font-bold text-rose-400 group-hover:bg-rose-500/25">
-                            {i + 1}
+                            {idx + 1}
                           </span>
                           <span className="font-mono text-slate-300 truncate text-xs flex-1">
                             {item.id}
@@ -652,11 +667,11 @@ export default function HomePage() {
                              <Tooltip 
                                 cursor={{fill: '#ffffff05'}}
                                 contentStyle={{ backgroundColor: "#1e293b", borderColor: "#334155", color: "#fff", borderRadius: "8px", border: "1px solid #475569" }}
-                                formatter={(value: any) => [Number(value).toFixed(4), "Deviation"]}
+                                formatter={(value: ValueType | undefined) => [Number(value ?? 0).toFixed(4), "Deviation"]}
                                 labelFormatter={(label) => `Feature Dimension ${label}`}
                              />
                              <Bar dataKey="deviation_score" fill="#c084fc" radius={[0, 4, 4, 0]} maxBarSize={30}>
-                               {selectedItem.explanation.top_contributors.map((entry: any, index: number) => (
+                               {selectedItem.explanation.top_contributors.map((_entry: ImageContributor, index: number) => (
                                   <Cell key={`cell-${index}`} fill={index < 3 ? "#c084fc" : "#a855f7"} />
                                ))}
                              </Bar>
@@ -685,7 +700,7 @@ export default function HomePage() {
                             contentStyle={{ backgroundColor: "#1e293b", borderColor: "#334155", color: "#fff", borderRadius: "8px", border: "1px solid #475569" }}
                          />
                          <Bar dataKey="error" fill="#f43f5e" radius={[0, 4, 4, 0]} maxBarSize={30}>
-                           {selectedItem.explanation.top_contributors.map((entry: any, index: number) => (
+                           {selectedItem.explanation.top_contributors.map((_entry: TabularContributor, index: number) => (
                               <Cell key={`cell-${index}`} fill={index === 0 ? "#f43f5e" : index === 1 ? "#fb7185" : "#fda4af"} />
                            ))}
                          </Bar>
