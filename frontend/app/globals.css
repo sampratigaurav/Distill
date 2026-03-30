@@ -47,3 +47,9 @@ body {
 .animate-neon-pulse { animation: neon-pulse 2s ease-in-out infinite; }
 .animate-scan-line  { animation: scan-line 1.5s ease-in-out infinite; }
 .animate-fade-up    { animation: fade-up 0.5s ease-out both; }
+
+/* ── Upload progress bar (indeterminate) ─────────────────── */
+@keyframes progress-slide {
+  0%   { transform: translateX(-150%); }
+  100% { transform: translateX(400%); }
+}

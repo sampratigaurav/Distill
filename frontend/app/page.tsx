@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useRef, useCallback } from "react";
+import React, { useState, useRef, useCallback, useEffect } from "react";
 import axios from "axios";
 import {
   ShieldCheck,
@@ -83,6 +83,15 @@ const MODEL_COLORS: Record<string, { bg: string; text: string; bar: string }> = 
 
 const DEFAULT_MODEL_STYLE = { bg: "bg-rose-500/15", text: "text-rose-400", bar: "#f43f5e" };
 
+/** Stepped status messages shown during the processing phase */
+const SCAN_MESSAGES = [
+  "Initiating PyTorch models...",
+  "Training Autoencoder on base patterns...",
+  "Calculating Isolation Forest boundaries...",
+  "Scanning rows for anomalies...",
+  "Finalizing ensemble votes...",
+] as const;
+
 /* ------------------------------------------------------------------ */
 /* Page Component                                                      */
 /* ------------------------------------------------------------------ */
@@ -90,6 +99,8 @@ export default function HomePage() {
   const [file, setFile] = useState<File | null>(null);
   const [selectedItem, setSelectedItem] = useState<FlaggedItem | null>(null);
   const [isScanning, setIsScanning] = useState(false);
+  const [scanPhase, setScanPhase] = useState<"upload" | "processing" | null>(null);
+  const [stepIndex, setStepIndex] = useState(0);
   const [isDownloading, setIsDownloading] = useState(false);
   const [results, setResults] = useState<ScanResults | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -119,20 +130,44 @@ export default function HomePage() {
     [handleFile]
   );
 
+  /* ---- Step message cycler (runs only during processing phase) ---- */
+  useEffect(() => {
+    if (scanPhase !== "processing") return;
+    setStepIndex(0);
+    const interval = setInterval(() => {
+      setStepIndex((prev) => (prev + 1) % SCAN_MESSAGES.length);
+    }, 4000);
+    return () => clearInterval(interval);
+  }, [scanPhase]);
+
   /* ---- Scan API call -------------------------------------------- */
   const scanDataset = async () => {
     if (!file) return;
     setIsScanning(true);
+    setScanPhase("upload");
     setResults(null);
     setError(null);
 
     try {
       const formData = new FormData();
       formData.append("file", file);
-      const { data } = await axios.post<ScanResults>(
+
+      // Switch to processing phase once the request is sent
+      const requestPromise = axios.post<ScanResults>(
         `${API_URL}/scan-dataset`,
-        formData
+        formData,
+        {
+          onUploadProgress: (progressEvent) => {
+            if (progressEvent.progress === 1) {
+              setScanPhase("processing");
+            }
+          },
+        }
       );
+
+      // Ensure we enter processing phase even if onUploadProgress fires late
+      setScanPhase("processing");
+      const { data } = await requestPromise;
       setResults(data);
     } catch (err: unknown) {
       if (axios.isAxiosError(err)) {
@@ -146,6 +181,7 @@ export default function HomePage() {
       }
     } finally {
       setIsScanning(false);
+      setScanPhase(null);
     }
   };
 
@@ -293,7 +329,11 @@ export default function HomePage() {
             className="relative inline-flex items-center gap-2.5 rounded-xl bg-gradient-to-r from-sky-600 to-cyan-500 px-8 py-3.5 text-sm font-bold text-white shadow-lg shadow-sky-600/25 transition-all hover:shadow-sky-500/40 hover:scale-[1.03] active:scale-[0.98] disabled:opacity-40 disabled:pointer-events-none disabled:shadow-none"
           >
             <Activity className="h-4 w-4" />
-            {isScanning ? "Scanning…" : "Scan Dataset"}
+            {scanPhase === "upload"
+              ? "Uploading…"
+              : scanPhase === "processing"
+              ? "Processing…"
+              : "Scan Dataset"}
           </button>
         </div>
 
@@ -318,7 +358,7 @@ export default function HomePage() {
 
         {/* ── Scanning Animation ─────────────────────────────────── */}
         {isScanning && (
-          <div className="flex flex-col items-center gap-6 py-16 animate-fade-up">
+          <div className="flex flex-col items-center gap-6 py-12 animate-fade-up">
             {/* scanner box */}
             <div className="relative h-40 w-40 rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] overflow-hidden">
               {/* sweep line */}
@@ -328,15 +368,43 @@ export default function HomePage() {
                 <ShieldAlert className="h-14 w-14 text-sky-400 animate-pulse" />
               </div>
             </div>
-            <div className="text-center">
-              <p className="text-base font-semibold text-white">
-                Distilling dataset…
-              </p>
-              <p className="mt-1 text-sm text-slate-400 max-w-md">
-                Extracting universal features and running ensemble detection
-                (Autoencoder + Deep&nbsp;SVDD + Isolation&nbsp;Forest)
-              </p>
-            </div>
+
+            {/* ── Phase indicator ───────────────────────────────────── */}
+            {scanPhase === "upload" ? (
+              <div className="w-full max-w-sm flex flex-col items-center gap-3">
+                <p className="text-sm font-semibold text-sky-300 flex items-center gap-2">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Uploading dataset…
+                </p>
+                {/* indeterminate progress bar */}
+                <div className="w-full h-1.5 rounded-full bg-slate-700 overflow-hidden">
+                  <div className="h-full w-1/3 rounded-full bg-gradient-to-r from-sky-500 to-cyan-400 animate-[progress-slide_1.4s_ease-in-out_infinite]" />
+                </div>
+              </div>
+            ) : (
+              <div className="w-full max-w-sm flex flex-col items-center gap-3">
+                {/* stepped message */}
+                <p
+                  key={stepIndex}
+                  className="text-sm font-semibold text-cyan-300 animate-fade-up text-center"
+                >
+                  {SCAN_MESSAGES[stepIndex]}
+                </p>
+                {/* step dots */}
+                <div className="flex gap-1.5">
+                  {SCAN_MESSAGES.map((_, i) => (
+                    <span
+                      key={i}
+                      className={`h-1.5 rounded-full transition-all duration-500 ${
+                        i === stepIndex
+                          ? "w-5 bg-cyan-400"
+                          : "w-1.5 bg-slate-600"
+                      }`}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
 
