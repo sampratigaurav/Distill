@@ -82,34 +82,26 @@ class TestEvaluateBinaryVotes:
 
     def test_sensitive_threshold_for_small_dataset(self):
         """
-        n_samples < 100 uses threshold 4.0; n_samples >= 100 uses 3.5.
-        An outlier with a mod-z-score between 3.5 and 4.0 should be caught
-        only by the large-dataset (3.5) threshold.
-        The higher threshold for small datasets makes it HARDER to get flagged.
+        n_samples < 200 uses threshold 3.0; n_samples >= 200 uses 3.5.
+        An outlier with a mod-z-score between 3.0 and 3.5 should be caught
+        only by the small-dataset (3.0) threshold.
         """
-        # Construct scores whose single outlier's mod-z-score lands ~3.7
-        # (above 3.5 but below 4.0) so the large-dataset run flags it but
-        # the small-dataset run does not.
-        base = np.zeros(200, dtype=np.float32)
-        # MAD-based mod-z-score for the outlier:
-        #   0.6745 * (outlier - median) / mad = target
-        # With all-zero base, median=0, MAD will be computed from zeros + outlier.
-        # The exact value doesn't matter; we just verify the threshold split behaviour.
-        # Use a value we know sits between 3.5 and 4.0 by construction.
-        # Place exactly 100 copies for large and 50 for small; scale outlier
-        # so mod-z-score ≈ 3.7.
-        mad_scale = 1e-5  # epsilon floor used internally
-        target_modz = 3.7
+        # Place exactly 250 copies for large and 150 for small
+        base_large = np.zeros(250, dtype=np.float32)
+        base_small = np.zeros(150, dtype=np.float32)
+
+        # Scale outlier so mod-z-score ≈ 3.2 (Caught by 3.0, ignored by 3.5)
+        mad_scale = 1e-5
+        target_modz = 3.2
         outlier_val = float(target_modz * mad_scale / 0.6745)
-        base_large = np.zeros(150, dtype=np.float32)
+
         base_large[0] = outlier_val
-        base_small = np.zeros(50, dtype=np.float32)
         base_small[0] = outlier_val
 
-        flags_large = _votes(base_large, n_samples=150)  # threshold 3.5
-        flags_small = _votes(base_small, n_samples=50)   # threshold 3.0
+        flags_large = _votes(base_large, n_samples=250)  # Uses threshold 3.5
+        flags_small = _votes(base_small, n_samples=150)  # Uses threshold 3.0
 
-        assert flags_large[0] == 1, "outlier should be flagged with large-dataset threshold 3.5"
+        assert flags_large[0] == 0, "outlier should NOT be flagged with large-dataset threshold 3.5"
         assert flags_small[0] == 1, "outlier should be flagged with the small-dataset threshold of 3.0"
 
     def test_mad_epsilon_floor_prevents_zero_division(self):
