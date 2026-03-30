@@ -96,7 +96,7 @@ def get_binary_votes(raw_scores: np.ndarray, n_samples: int) -> np.ndarray:
     mad = np.maximum(mad, 1e-5) # Prevent zero-division
     
     mod_z_scores = 0.6745 * (raw_scores - median) / mad
-    threshold = 4.0 if n_samples < 100 else 3.5
+    threshold = 2.0 if n_samples < 200 else 3.5
     return (mod_z_scores > threshold).astype(np.int32)
 
 
@@ -106,7 +106,7 @@ def _train_autoencoder(
     """Train a DynamicAutoencoder with Early Stopping; return (raw_scores, reconstructions)."""
     model = DynamicAutoencoder(input_dim).to(device)
     model.train()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
     criterion = nn.MSELoss()
 
     loader = DataLoader(
@@ -159,7 +159,7 @@ def _train_deep_svdd(
         model.center.copy_(initial_out.mean(dim=0))
 
     model.train()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
 
     loader = DataLoader(
         TensorDataset(tensor_data), batch_size=BATCH_SIZE, shuffle=True
@@ -316,6 +316,13 @@ async def scan_dataset(request: Request, file: UploadFile = File(...)):
 
         # 2. Prepare PyTorch tensor
         tensor_data = torch.tensor(feature_vectors, dtype=torch.float32)
+
+        # L2-Normalize high-dimensional embeddings (e.g., ResNet-18) to the unit sphere
+        # This converts MSE/Euclidean distance into Cosine Distance
+        if input_dim >= 512:
+            import torch.nn.functional as F
+            tensor_data = F.normalize(tensor_data, p=2, dim=1)
+            feature_vectors = tensor_data.numpy()
 
         # 3. Run all three detectors to get raw scores
         raw_ae, ae_recons = _train_autoencoder(tensor_data, input_dim)
