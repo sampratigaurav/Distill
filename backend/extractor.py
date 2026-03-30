@@ -15,6 +15,8 @@ from __future__ import annotations
 import io
 import os
 import zipfile
+import tempfile
+import ast
 from typing import List, Tuple
 
 import numpy as np
@@ -56,8 +58,16 @@ class UniversalExtractor:
         # Lazy-loaded on first image ZIP upload
         self._resnet: nn.Module | None = None
         self._transform: T.Compose | None = None
+        self._text_model = None
         self.last_columns: List[str] = []
         self.last_images: dict[str, Image.Image] = {}
+        self.current_chunk_text_snippets: dict[str, dict[str, str]] = {}
+
+    def _load_text_model(self) -> None:
+        if self._text_model is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            from sentence_transformers import SentenceTransformer
+            self._text_model = SentenceTransformer("all-MiniLM-L6-v2").to(self.device)
 
     # ------------------------------------------------------------------
     # Public API
@@ -65,184 +75,213 @@ class UniversalExtractor:
 
     async def process_upload(
         self, file: UploadFile
-    ) -> Tuple[np.ndarray, List[str]]:
+    ) -> Tuple[object, str]:
         """
-        Read *file* and return ``(features, identifiers)``.
-
-        Parameters
-        ----------
-        file : fastapi.UploadFile
-            An uploaded ``.csv`` or ``.zip`` (containing CSVs **or** images).
-
-        Returns
-        -------
-        features : np.ndarray
-            2-D array of shape ``(n_samples, n_features)``.
-        identifiers : list[str]
-            Row indices (CSV) or filenames (images) — one per sample.
-
-        Raises
-        ------
-        HTTPException (400)
-            If the file type is not supported.
+        Save file to temp storage and return (generator_stream, temp_file_path).
         """
         filename = (file.filename or "").lower()
-
+        fd, temp_path = tempfile.mkstemp(suffix=_file_ext(filename))
+        
+        with os.fdopen(fd, 'wb') as f:
+            while True:
+                chunk = await file.read(1024 * 1024 * 4) # 4MB
+                if not chunk:
+                    break
+                f.write(chunk)
+                
         if filename.endswith(".csv"):
-            raw = await file.read()
-            df = pd.read_csv(io.BytesIO(raw))
-            return self._process_dataframe(df)
+            return self._stream_csv(temp_path), temp_path
         elif filename.endswith(".zip"):
-            return await self._process_zip(file)
+            return self._stream_zip(temp_path), temp_path
         else:
+            os.remove(temp_path)
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"Unsupported file type: '{filename}'. "
-                    "Please upload a .csv or a .zip archive."
-                ),
+                detail="Unsupported file type: Please upload a .csv or a .zip archive.",
             )
 
     # ------------------------------------------------------------------
     # Tabular (DataFrame) pipeline
     # ------------------------------------------------------------------
 
-    def _process_dataframe(
-        self, df: pd.DataFrame, id_prefix: str = ""
-    ) -> Tuple[np.ndarray, List[str]]:
-        """Impute, scale & encode a DataFrame. Returns features + identifiers."""
+    def _stream_csv(self, file_path: str, id_prefix: str = ""):
         self.last_images.clear()
         self.last_columns.clear()
+        self.current_chunk_text_snippets.clear()
 
-        # Down-sample large datasets to keep training times bounded.
-        if len(df) > MAX_SAMPLE_SIZE:
-            df = df.sample(n=MAX_SAMPLE_SIZE, random_state=42).reset_index(drop=True)
-
-        num_cols = df.select_dtypes(include="number").columns.tolist()
-        cat_cols = df.select_dtypes(exclude="number").columns.tolist()
-
-        parts: list[np.ndarray] = []
-
-        # --- Numerical columns ---
-        if num_cols:
-            num_df = df[num_cols].copy()
-            # Handle partial missing values with column mean, and all-NaN cols with 0.0
-            num_df = num_df.fillna(num_df.mean()).fillna(0.0)
-            scaler = StandardScaler()
-            parts.append(scaler.fit_transform(num_df.values))
-            self.last_columns.extend(num_cols)
-
-        # --- Categorical columns ---
-        if cat_cols:
-            cat_dict = {}
-            for col in cat_cols:
-                col_series = df[col]
-                if col_series.nunique() > 100:
-                    continue
-                mode_val = col_series.mode()
-                fill_val = mode_val.iloc[0] if not mode_val.empty else "MISSING"
-                cat_dict[col] = col_series.fillna(fill_val)
+        # Track state for scaling across chunks
+        num_cols = None
+        cat_cols = None
+        text_cols = None
+        scaler = StandardScaler()
+        encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
+        mean_vals = None
+        cat_fill_vals = None
+        
+        chunk_idx = 0
+        
+        # Read file in 10,000 row chunks strictly from disk
+        for df in pd.read_csv(file_path, chunksize=MAX_SAMPLE_SIZE):
+            
+            # FIT PHASE: Chunk 0 calculates state
+            if chunk_idx == 0:
+                num_cols = df.select_dtypes(include="number").columns.tolist()
+                str_cols = df.select_dtypes(exclude="number").columns.tolist()
                 
-            if cat_dict:
-                cat_df = pd.DataFrame(cat_dict)
-                encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
-                parts.append(encoder.fit_transform(cat_df.values))
-                self.last_columns.extend(list(encoder.get_feature_names_out(cat_df.columns)))
+                # Check if this is a Zip combined file which has __source_file__
+                if "__source_file__" in num_cols: num_cols.remove("__source_file__")
+                if "__source_file__" in str_cols: str_cols.remove("__source_file__")
 
-        if not parts:
-            raise HTTPException(
-                status_code=400,
-                detail="The CSV contains no usable columns.",
-            )
+                cat_cols = []
+                text_cols = []
+                
+                for col in str_cols:
+                    if df[col].nunique() > 100:
+                        avg_len = df[col].astype(str).str.len().mean()
+                        if avg_len > 15:
+                            text_cols.append(col)
+                        else:
+                            cat_cols.append(col)
+                    else:
+                        cat_cols.append(col)
 
-        features = np.concatenate(parts, axis=1).astype(np.float32)
-        identifiers = [f"{id_prefix}{idx}" for idx in df.index.tolist()]
-        return features, identifiers
+                if num_cols:
+                    mean_vals = df[num_cols].mean()
+                    num_train = df[num_cols].fillna(mean_vals).fillna(0.0)
+                    scaler.fit(num_train.values)
+                    self.last_columns.extend(num_cols)
+                    
+                if cat_cols:
+                    cat_fill_vals = {}
+                    cat_dict_train = {}
+                    valid_cat_cols = []
+                    for col in cat_cols:
+                        if df[col].nunique() > 100: continue
+                        mode_val = df[col].mode()
+                        fill_val = mode_val.iloc[0] if not mode_val.empty else "MISSING"
+                        cat_fill_vals[col] = fill_val
+                        cat_dict_train[col] = df[col].fillna(fill_val)
+                        valid_cat_cols.append(col)
+                        
+                    cat_cols = valid_cat_cols
+                    
+                    if cat_dict_train:
+                        cat_df = pd.DataFrame(cat_dict_train)
+                        encoder.fit(cat_df.values)
+                        self.last_columns.extend(list(encoder.get_feature_names_out(cat_df.columns)))
+                        
+                if text_cols:
+                    self._load_text_model()
+                    for col in text_cols:
+                        for dim in range(384): # all-MiniLM-L6-v2 dim
+                            self.last_columns.append(f"__TEXT__:{col}_dim{dim}")
 
-    # ------------------------------------------------------------------
+            # YIELD PHASE: transform current chunk
+            if "__source_file__" in df.columns:
+                 source_col = df["__source_file__"]
+                 identifiers = [f"{source_col.iloc[i]}:row_{chunk_idx*MAX_SAMPLE_SIZE + i}" for i in range(len(df))]
+            else:
+                 identifiers = [f"{id_prefix}{chunk_idx*MAX_SAMPLE_SIZE + i}" for i in range(len(df))]
+                 
+            self.current_chunk_text_snippets.clear()
+            parts = []
+            
+            if num_cols:
+                num_chunk = df[num_cols].fillna(mean_vals).fillna(0.0)
+                parts.append(scaler.transform(num_chunk.values))
+                
+            if cat_cols:
+                cat_dict_chunk = {}
+                for col in cat_cols:
+                    cat_dict_chunk[col] = df[col].fillna(cat_fill_vals[col])
+                cat_df_chunk = pd.DataFrame(cat_dict_chunk)
+                if cat_df_chunk.shape[1] > 0:
+                    parts.append(encoder.transform(cat_df_chunk.values))
+                    
+            if text_cols:
+                self._load_text_model()
+                for col in text_cols:
+                    text_data = df[col].fillna("").astype(str).tolist()
+                    
+                    for i, ident in enumerate(identifiers):
+                        if ident not in self.current_chunk_text_snippets:
+                            self.current_chunk_text_snippets[ident] = {}
+                        self.current_chunk_text_snippets[ident][col] = text_data[i][:500] # store max 500 chars
+
+                    embeddings = self._text_model.encode(text_data, batch_size=128, show_progress_bar=False)
+                    parts.append(embeddings)
+                
+            if not parts:
+                raise HTTPException(status_code=400, detail="Contains no usable columns.")
+                
+            features = np.concatenate(parts, axis=1).astype(np.float32)
+                 
+            yield features, identifiers
+            chunk_idx += 1
+
+
     # ZIP pipeline (content-aware)
     # ------------------------------------------------------------------
 
-    async def _process_zip(
-        self, file: UploadFile
-    ) -> Tuple[np.ndarray, List[str]]:
-        """
-        Inspect ZIP contents and route to the right pipeline:
-          • CSV files  → tabular pipeline (concatenated row-wise)
-          • Image files → ResNet-18 embedding pipeline
-        """
-        raw = await file.read()
-        archive = zipfile.ZipFile(io.BytesIO(raw))
+    def _stream_zip(self, temp_path: str):
+        with zipfile.ZipFile(temp_path) as archive:
+            csv_entries: list[str] = []
+            img_entries: list[str] = []
 
-        # --- Zip bomb protection: reject archives whose total uncompressed
-        #     size exceeds 1 GB before extracting any content. ---
-        _MAX_UNCOMPRESSED = 1 * 1024 * 1024 * 1024  # 1 GB
-        total_uncompressed = sum(info.file_size for info in archive.infolist())
-        if total_uncompressed > _MAX_UNCOMPRESSED:
-            raise HTTPException(
-                status_code=413,
-                detail="ZIP archive uncompressed size exceeds the 1 GB limit.",
-            )
+            for entry in archive.namelist():
+                if entry.endswith("/") or entry.startswith("__MACOSX"):
+                    continue
+                ext = _file_ext(entry)
+                if ext in _CSV_EXTENSIONS:
+                    csv_entries.append(entry)
+                elif ext in _IMAGE_EXTENSIONS:
+                    img_entries.append(entry)
 
-        # Classify entries
-        csv_entries: list[str] = []
-        img_entries: list[str] = []
-
-        for entry in archive.namelist():
-            if entry.endswith("/") or entry.startswith("__MACOSX"):
-                continue
-            ext = _file_ext(entry)
-            if ext in _CSV_EXTENSIONS:
-                csv_entries.append(entry)
-            elif ext in _IMAGE_EXTENSIONS:
-                img_entries.append(entry)
-
-        # Decide pipeline
-        if csv_entries:
-            return self._process_zip_csvs(archive, csv_entries)
-        elif img_entries:
-            return self._process_zip_images(archive, img_entries)
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "The ZIP archive contains no supported files. "
-                    "Include .csv files or images (.jpg, .jpeg, .png)."
-                ),
-            )
+            if csv_entries:
+                yield from self._stream_zip_csvs(archive, csv_entries)
+            elif img_entries:
+                yield from self._stream_zip_images(archive, img_entries)
+            else:
+                raise HTTPException(status_code=400, detail="The archive contains no supported files.")
 
     # ---- ZIP → tabular ---------------------------------------------------
 
-    def _process_zip_csvs(
-        self, archive: zipfile.ZipFile, csv_entries: list[str]
-    ) -> Tuple[np.ndarray, List[str]]:
-        """Read every CSV inside the archive, concat, and run the tabular pipeline."""
-        frames: list[pd.DataFrame] = []
-        for entry in csv_entries:
-            with archive.open(entry) as f:
-                df = pd.read_csv(f)
-            # Tag rows with the source filename (sanitized to prevent path traversal)
-            basename = os.path.basename(entry)
-            df.index = pd.RangeIndex(len(df))
-            df["__source_file__"] = basename
-            frames.append(df)
-
-        combined = pd.concat(frames, ignore_index=True)
-
-        # Build identifiers from source file + row offset
-        source_col = combined.pop("__source_file__")
-        identifiers_raw = [
-            f"{source_col.iloc[i]}:row_{i}" for i in range(len(combined))
-        ]
-
-        features, _ = self._process_dataframe(combined)
-        return features, identifiers_raw
+    def _stream_zip_csvs(self, archive: zipfile.ZipFile, csv_entries: list[str]):
+        """Safely stream all CSVs by building a merged temporary dataset."""
+        _MAX_UNCOMPRESSED = 1073741824  # 1 GB strict limit across all files
+        running_size = 0
+        
+        fd, combined_path = tempfile.mkstemp(suffix=".csv")
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as combined_f:
+                header_written = False
+                for entry in csv_entries:
+                    with archive.open(entry) as f:
+                        buf = bytearray()
+                        while True:
+                            chunk = f.read(8192)
+                            if not chunk: break
+                            running_size += len(chunk)
+                            if running_size > _MAX_UNCOMPRESSED:
+                                raise HTTPException(413, "Uncompressed contents exceed 1GB physical limit.")
+                            buf.extend(chunk)
+                            
+                    df = pd.read_csv(io.BytesIO(buf))
+                    basename = os.path.basename(entry)
+                    df["__source_file__"] = basename
+                    df.to_csv(combined_f, index=False, header=not header_written)
+                    header_written = True
+                    
+            yield from self._stream_csv(combined_path)
+            
+        finally:
+            if os.path.exists(combined_path):
+                os.remove(combined_path)
 
     # ---- ZIP → images ----------------------------------------------------
 
     def _load_resnet(self) -> None:
         """Lazy-init a headless ResNet-18 feature extractor."""
-        # --- SAFE FIX: Detect device and move model to GPU if available ---
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
@@ -250,7 +289,6 @@ class UniversalExtractor:
         resnet.eval()
         
         self._resnet = resnet.to(self.device)
-        # ------------------------------------------------------------------
 
         self._transform = T.Compose([
             T.Resize((224, 224)),
@@ -261,47 +299,53 @@ class UniversalExtractor:
             ),
         ])
 
-    def _process_zip_images(
-        self, archive: zipfile.ZipFile, img_entries: list[str]
-    ) -> Tuple[np.ndarray, List[str]]:
-        """Embed images via ResNet-18 and return 512-dim feature vectors."""
+    def _stream_zip_images(self, archive: zipfile.ZipFile, img_entries: list[str]):
+        """Embed images via ResNet-18 and yield chunked 512-dim feature vectors."""
         if self._resnet is None:
             self._load_resnet()
 
+        _MAX_UNCOMPRESSED = 1073741824  # 1 GB strict limit
+        running_size = 0
         tensors: list[torch.Tensor] = []
         filenames: list[str] = []
         
         self.last_columns.clear()
         self.last_images.clear()
+        
+        chunk_size = 64
 
         for entry in img_entries:
-            img_bytes = archive.read(entry)
-            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-            
-            # Sanitize filename to prevent path traversal
+            with archive.open(entry) as f:
+                buf = bytearray()
+                while True:
+                    chunk = f.read(8192)
+                    if not chunk: break
+                    running_size += len(chunk)
+                    if running_size > _MAX_UNCOMPRESSED:
+                        raise HTTPException(413, "Physical limits exceeded.")
+                    buf.extend(chunk)
+
+            img = Image.open(io.BytesIO(buf)).convert("RGB")
             filename = os.path.basename(entry)
             self.last_images[filename] = img.copy()
             
-            tensor = self._transform(img)  # type: ignore[misc]
+            tensor = self._transform(img)
             tensors.append(tensor)
             filenames.append(filename)
-
-        batch = torch.stack(tensors)
-
-        # --- SAFE FIX: Process in chunks to prevent OOM ---
-        embeddings_list = []
-        chunk_size = 64
-        
-        with torch.no_grad():
-            for i in range(0, len(batch), chunk_size):
-                # --- SAFE FIX: Move chunk to GPU before passing to ResNet ---
-                chunk = batch[i:i + chunk_size].to(self.device)
-                chunk_embeds = self._resnet(chunk)
-                embeddings_list.append(chunk_embeds)
-                # ------------------------------------------------------------
+            
+            if len(tensors) >= chunk_size:
+                batch_tensor = torch.stack(tensors).to(self.device)
+                with torch.no_grad():
+                    features = self._resnet(batch_tensor).cpu().numpy()
+                yield features, filenames
                 
-        embeddings = torch.cat(embeddings_list, dim=0)
-        # --------------------------------------------------
-
-        features = embeddings.cpu().numpy().astype(np.float32)
-        return features, filenames
+                # Clear per-chunk memory to stay OOM-safe
+                self.last_images.clear()
+                tensors = []
+                filenames = []
+                
+        if tensors:
+            batch_tensor = torch.stack(tensors).to(self.device)
+            with torch.no_grad():
+                features = self._resnet(batch_tensor).cpu().numpy()
+            yield features, filenames

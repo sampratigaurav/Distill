@@ -9,3 +9,5 @@ numpy
 opencv-python-headless
 pillow
 slowapi
+fpdf2
+sentence-transformers

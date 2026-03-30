@@ -11,9 +11,11 @@ Ensemble:     ≥ 2 / 3 model votes → "poisoned".
 from __future__ import annotations
 
 import io
+import uuid
 import json
 import os
 import random
+from fpdf import FPDF
 import shutil
 import zipfile
 from typing import List, Tuple
@@ -22,9 +24,9 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from fastapi import FastAPI, File, Form, UploadFile, Request, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, Request, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from sklearn.ensemble import IsolationForest
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -48,11 +50,42 @@ except Exception:
 # ---------------------------------------------------------------------------
 # App & middleware
 # ---------------------------------------------------------------------------
+
+class LimitUploadSizeMiddleware:
+    """
+    ASGI Middleware to physically count bytes streamed into the server.
+    Raises a 413 error if the total payload exceeds the max_upload_size limit,
+    preventing malicious memory exhaustion attacks without relying on HTTP headers.
+    """
+    def __init__(self, app, max_upload_size: int = 1073741824): # 1GB Limit
+        self.app = app
+        self.max_upload_size = max_upload_size
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        total_size = 0
+
+        async def receive_with_limit():
+            nonlocal total_size
+            message = await receive()
+            if message["type"] == "http.request":
+                chunk_size = len(message.get("body", b""))
+                total_size += chunk_size
+                if total_size > self.max_upload_size:
+                    raise HTTPException(status_code=413, detail="Dataset exceeds 1GB physical byte limit.")
+            return message
+
+        await self.app(scope, receive_with_limit, send)
+
 app = FastAPI(
     title="Universal Data Sanitization API",
     description="Detect and sanitize anomalous data using ensemble anomaly detection.",
     version="0.2.0",
 )
+
+app.add_middleware(LimitUploadSizeMiddleware)
 
 # Rate limiter (5 requests / minute per IP on heavy endpoints)
 limiter = Limiter(key_func=get_remote_address)
@@ -100,30 +133,30 @@ MODEL_ISO = "Isolation Forest"
 # Helpers
 # ---------------------------------------------------------------------------
 
-def get_binary_votes(raw_scores: np.ndarray, n_samples: int) -> np.ndarray:
-    """Calculate MAD scaling with a strict limit check to prevent threshold squeezing."""
-    median = np.median(raw_scores)
-    mad = np.median(np.abs(raw_scores - median))
-    mad = np.maximum(mad, 1e-5) # Prevent zero-division
+def _calibrate_mad_threshold(raw_scores: np.ndarray, n_samples: int) -> Tuple[float, float, float]:
+    """Calculate and freeze MAD scaling logic on the first training chunk."""
+    median = float(np.median(raw_scores))
+    mad = float(np.median(np.abs(raw_scores - median)))
+    mad = max(mad, 1e-5) # Prevent zero-division
     
-    mod_z_scores = 0.6745 * (raw_scores - median) / mad
-    
-    # FIX: Increased from 2.0 to 3.0 for small datasets to prevent false positives on clean data
     threshold = 3.0 if n_samples < 200 else 3.5
+    return median, mad, threshold
+
+def _evaluate_binary_votes(raw_scores: np.ndarray, median: float, mad: float, threshold: float) -> np.ndarray:
+    """Evaluate an arbitrary chunk against the frozen MAD framework."""
+    mod_z_scores = 0.6745 * (raw_scores - median) / mad
     return (mod_z_scores > threshold).astype(np.int32)
 
 
-def _train_autoencoder(
-    tensor_data: torch.Tensor, input_dim: int
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Train a DynamicAutoencoder with Early Stopping; return (raw_scores, reconstructions)."""
+def _train_autoencoder(train_tensor: torch.Tensor, input_dim: int) -> DynamicAutoencoder:
+    """Train a DynamicAutoencoder with Early Stopping on the primary chunk."""
     model = DynamicAutoencoder(input_dim).to(device)
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
     criterion = nn.MSELoss()
 
     loader = DataLoader(
-        TensorDataset(tensor_data), batch_size=BATCH_SIZE, shuffle=True
+        TensorDataset(train_tensor), batch_size=BATCH_SIZE, shuffle=True
     )
 
     best_loss = float("inf")
@@ -150,10 +183,12 @@ def _train_autoencoder(
                 break
 
     model.eval()
-    
-    # Chunk evaluation to prevent OOM
+    return model
+
+def _evaluate_autoencoder(model: DynamicAutoencoder, eval_tensor: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
+    """Evaluate an arbitrary chunk against the trained Autoencoder."""
     eval_loader = DataLoader(
-        TensorDataset(tensor_data), batch_size=BATCH_SIZE, shuffle=False
+        TensorDataset(eval_tensor), batch_size=BATCH_SIZE, shuffle=False
     )
     
     all_recons = []
@@ -167,22 +202,17 @@ def _train_autoencoder(
             
     reconstructions = np.concatenate(all_recons, axis=0)
     errors = np.concatenate(all_errors, axis=0)
-
     return errors, reconstructions
 
 
-def _train_deep_svdd(
-    tensor_data: torch.Tensor, input_dim: int
-) -> np.ndarray:
-    """Train a DynamicDeepSVDD with Early Stopping; return raw_scores."""
+def _train_deep_svdd(train_tensor: torch.Tensor, input_dim: int) -> DynamicDeepSVDD:
+    """Train a DynamicDeepSVDD with Early Stopping on the primary chunk."""
     model = DynamicDeepSVDD(input_dim).to(device)
     
     # Initialize center c
     model.eval()
-    
-    # --- SAFE FIX: Batch the center initialization to prevent OOM ---
     center_loader = DataLoader(
-        TensorDataset(tensor_data), batch_size=BATCH_SIZE, shuffle=False
+        TensorDataset(train_tensor), batch_size=BATCH_SIZE, shuffle=False
     )
     initial_outputs = []
     
@@ -190,16 +220,13 @@ def _train_deep_svdd(
         for (c_batch,) in center_loader:
             initial_outputs.append(model(c_batch.to(device)))
             
-    # Calculate the mean across all batches
     all_initial_out = torch.cat(initial_outputs, dim=0)
     model.center.copy_(all_initial_out.mean(dim=0))
-    # ----------------------------------------------------------------
 
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
-
     loader = DataLoader(
-        TensorDataset(tensor_data), batch_size=BATCH_SIZE, shuffle=True
+        TensorDataset(train_tensor), batch_size=BATCH_SIZE, shuffle=True
     )
 
     best_loss = float("inf")
@@ -226,32 +253,31 @@ def _train_deep_svdd(
                 break
 
     model.eval()
-    
-    # Chunk evaluation to prevent OOM
+    return model
+
+def _evaluate_deep_svdd(model: DynamicDeepSVDD, eval_tensor: torch.Tensor) -> np.ndarray:
+    """Evaluate an arbitrary chunk against the trained Deep SVDD."""
     eval_loader = DataLoader(
-        TensorDataset(tensor_data), batch_size=BATCH_SIZE, shuffle=False
+        TensorDataset(eval_tensor), batch_size=BATCH_SIZE, shuffle=False
     )
     
     all_distances = []
-    
     with torch.no_grad():
         for (batch,) in eval_loader:
             batch_dev = batch.to(device)
             all_distances.append(model.anomaly_score(batch_dev).cpu().numpy())
             
     distances = np.concatenate(all_distances, axis=0)
-
     return distances
 
 
-def _run_isolation_forest(feature_vectors: np.ndarray) -> np.ndarray:
-    """Fit an IsolationForest and return continuous anomaly scores."""
-    # FIX: Use auto contamination instead of a forced mathematical quota
+def _train_isolation_forest(train_features: np.ndarray) -> IsolationForest:
     iso = IsolationForest(contamination='auto', random_state=42)
-    iso.fit(feature_vectors)
-    
-    # Sklearn decision_function returns negative values for outliers
-    raw_scores = -1.0 * iso.decision_function(feature_vectors)
+    iso.fit(train_features)
+    return iso
+
+def _evaluate_isolation_forest(model: IsolationForest, eval_features: np.ndarray) -> np.ndarray:
+    raw_scores = -1.0 * model.decision_function(eval_features)
     return raw_scores
 
 
@@ -272,10 +298,29 @@ def _generate_xai_payload(
         diff = np.abs(orig_f - recon_f)
         cols = extractor.last_columns
         error_map = {}
-        # Aggregate expanded OneHot columns back to original names
+        text_error_map = {}
+        # Aggregate expanded columns back to original names
         for idx, col in enumerate(cols):
-            base_col = col.split("_")[0] if "_" in col else col
-            error_map[base_col] = error_map.get(base_col, 0.0) + float(diff[idx])
+            if col.startswith("__TEXT__:"):
+                base_col = col.replace("__TEXT__:", "").split("_dim")[0]
+                text_error_map[base_col] = text_error_map.get(base_col, 0.0) + float(diff[idx])
+            else:
+                base_col = col.split("_")[0] if "_" in col else col
+                error_map[base_col] = error_map.get(base_col, 0.0) + float(diff[idx])
+                
+        if text_error_map:
+            best_text_col = max(text_error_map, key=text_error_map.get)
+            best_text_err = text_error_map[best_text_col]
+            
+            best_tab_err = max(error_map.values()) if error_map else 0.0
+                
+            if best_text_err > best_tab_err:
+                snippet = extractor.current_chunk_text_snippets.get(ident, {}).get(best_text_col, "Text snippet missing")
+                return {
+                    "type": "text",
+                    "snippet": snippet,
+                    "column": best_text_col
+                }
             
         sorted_errors = sorted(error_map.items(), key=lambda x: x[1], reverse=True)
         top_3 = [{"name": k, "error": v} for k, v in sorted_errors[:3]]
@@ -333,6 +378,7 @@ async def health():
 
 # Temp uploads directory used in the Modal container
 _TEMP_UPLOADS_DIR = os.getenv('TEMP_UPLOADS_DIR', os.path.join(os.getcwd(), 'temp_uploads'))
+os.makedirs(_TEMP_UPLOADS_DIR, exist_ok=True)
 
 
 def _purge_temp_uploads() -> None:
@@ -349,64 +395,147 @@ async def scan_dataset(request: Request, file: UploadFile = File(...)):
     Upload a CSV or ZIP, run an ensemble of three anomaly detectors,
     and return the flagged (poisoned) samples with per-model attribution.
     """
-    content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > 1073741824:
-        raise HTTPException(status_code=413, detail="Dataset exceeds 1GB limit.")
 
     try:
         torch.manual_seed(42)
         np.random.seed(42)
         random.seed(42)
 
-        # 1. Extract features
-        feature_vectors, identifiers = await extractor.process_upload(file)
-        n_samples, input_dim = feature_vectors.shape
+        # 1. Mount the generator stream
+        data_stream, temp_path = await extractor.process_upload(file)
 
-        # 2. Prepare PyTorch tensor
-        tensor_data = torch.tensor(feature_vectors, dtype=torch.float32)
+        try:
+            # 2. Extract Chunk 0 (The Base Pattern)
+            first_features, first_identifiers = next(data_stream)
+            input_dim = first_features.shape[1]
+            
+            # 3. Prepare PyTorch tensors for Chunk 0
+            chunk0_tensor = torch.tensor(first_features, dtype=torch.float32)
 
-        # L2-Normalize high-dimensional embeddings (e.g., ResNet-18) to the unit sphere
-        # This converts MSE/Euclidean distance into Cosine Distance
-        if input_dim >= 512:
-            import torch.nn.functional as F
-            tensor_data = F.normalize(tensor_data, p=2, dim=1)
-            feature_vectors = tensor_data.numpy()
+            # L2-Normalize high-dimensional embeddings
+            if input_dim >= 512:
+                import torch.nn.functional as F
+                chunk0_tensor = F.normalize(chunk0_tensor, p=2, dim=1)
+                first_features = chunk0_tensor.numpy()
 
-        # 3. Run all three detectors to get raw scores
-        raw_ae, ae_recons = _train_autoencoder(tensor_data, input_dim)
-        raw_svdd = _train_deep_svdd(tensor_data, input_dim)
-        raw_if = _run_isolation_forest(feature_vectors)
+            # 4. Train Models exclusively on Chunk 0
+            ae_model = _train_autoencoder(chunk0_tensor, input_dim)
+            svdd_model = _train_deep_svdd(chunk0_tensor, input_dim)
+            iso_model = _train_isolation_forest(first_features)
+            
+            # 5. Calibrate MAD Thresholds
+            raw_ae, _ = _evaluate_autoencoder(ae_model, chunk0_tensor)
+            raw_svdd = _evaluate_deep_svdd(svdd_model, chunk0_tensor)
+            raw_iso = _evaluate_isolation_forest(iso_model, first_features)
+            
+            # Freeze thresholds using Chunk 0 topography
+            chunk0_len = len(first_features)
+            ae_median, ae_mad, ae_thresh = _calibrate_mad_threshold(raw_ae, chunk0_len)
+            svdd_median, svdd_mad, svdd_thresh = _calibrate_mad_threshold(raw_svdd, chunk0_len)
+            iso_median, iso_mad, iso_thresh = _calibrate_mad_threshold(raw_iso, chunk0_len)
+            
+            median_vector = np.median(first_features, axis=0)
 
-        # 4. Strict Consensus Voting
-        ae_flags = get_binary_votes(raw_ae, n_samples)
-        svdd_flags = get_binary_votes(raw_svdd, n_samples)
-        iso_flags = get_binary_votes(raw_if, n_samples)
+            # 6. Stream Engine Loop
+            flagged_items = []
+            total_samples = 0
+            model_breakdown = { MODEL_AE: 0, MODEL_SVDD: 0, MODEL_ISO: 0 }
+            
+            # Re-inject Chunk 0 into the evaluation pipeline seamlessly
+            import itertools
+            full_stream = itertools.chain([(first_features, first_identifiers)], data_stream)
+            
+            for features, identifiers in full_stream:
+                chunk_len = len(features)
+                total_samples += chunk_len
+                
+                tensor = torch.tensor(features, dtype=torch.float32)
+                if input_dim >= 512:
+                    tensor = F.normalize(tensor, p=2, dim=1)
+                    features = tensor.numpy()
+                    
+                # OOM-Safe chunk evaluation
+                c_raw_ae, c_recons = _evaluate_autoencoder(ae_model, tensor)
+                c_raw_svdd = _evaluate_deep_svdd(svdd_model, tensor)
+                c_raw_iso = _evaluate_isolation_forest(iso_model, features)
+                
+                # Apply frozen thresholds
+                ae_flags = _evaluate_binary_votes(c_raw_ae, ae_median, ae_mad, ae_thresh)
+                svdd_flags = _evaluate_binary_votes(c_raw_svdd, svdd_median, svdd_mad, svdd_thresh)
+                iso_flags = _evaluate_binary_votes(c_raw_iso, iso_median, iso_mad, iso_thresh)
+                
+                model_breakdown[MODEL_AE] += int(ae_flags.sum())
+                model_breakdown[MODEL_SVDD] += int(svdd_flags.sum())
+                model_breakdown[MODEL_ISO] += int(iso_flags.sum())
+                
+                # Generate XAI Explanations strictly for flagged samples
+                chunk_flags = _build_flagged_items(
+                    identifiers, ae_flags, svdd_flags, iso_flags, features, c_recons, median_vector
+                )
+                flagged_items.extend(chunk_flags)
+                
+            poisoned_count = len(flagged_items)
+            anomaly_pct = round((poisoned_count / total_samples) * 100, 2) if total_samples > 0 else 0.0
 
-        # Calculate median vector for Image XAI
-        median_vector = np.median(feature_vectors, axis=0)
+            return {
+                "total_samples": total_samples,
+                "poisoned_samples": poisoned_count,
+                "anomaly_percentage": anomaly_pct,
+                "model_breakdown": model_breakdown,
+                "flagged_items": flagged_items,
+            }
+            
+        finally:
+            remove_file(temp_path)
 
-        # 5. Build enriched results
-        flagged_items = _build_flagged_items(
-            identifiers, ae_flags, svdd_flags, iso_flags, feature_vectors, ae_recons, median_vector
-        )
-        poisoned_count = len(flagged_items)
-        anomaly_pct = round((poisoned_count / n_samples) * 100, 2)
-
-        return {
-            "total_samples": n_samples,
-            "poisoned_samples": poisoned_count,
-            "anomaly_percentage": anomaly_pct,
-            "model_breakdown": {
-                MODEL_AE: int(ae_flags.sum()),
-                MODEL_SVDD: int(svdd_flags.sum()),
-                MODEL_ISO: int(iso_flags.sum()),
-            },
-            "flagged_items": flagged_items,
-        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
     finally:
         _purge_temp_uploads()
+
+def _generate_pdf_receipt(scan_results: dict, filename: str) -> bytes:
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("helvetica", style="B", size=16)
+    pdf.cell(0, 10, "Distill Sanitization Receipt", new_x="LMARGIN", new_y="NEXT", align="C")
+    
+    pdf.set_font("helvetica", size=12)
+    pdf.cell(0, 10, f"Original File: {filename}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 10, f"Total Samples: {scan_results.get('total_samples', 0)}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 10, f"Poisoned Samples Removed: {scan_results.get('poisoned_samples', 0)}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 10, f"Anomaly Percentage: {scan_results.get('anomaly_percentage', 0)}%", new_x="LMARGIN", new_y="NEXT")
+    
+    pdf.ln(5)
+    pdf.set_font("helvetica", style="B", size=14)
+    pdf.cell(0, 10, "Top 5 Most Toxic Data Points:", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("helvetica", size=10)
+    
+    flagged = scan_results.get("flagged_items", [])
+    top_5 = flagged[:5]
+    
+    for item in top_5:
+        item_id = item.get("id", "Unknown")
+        models = ", ".join(item.get("flagged_by", []))
+        pdf.set_font("helvetica", style="B", size=10)
+        pdf.cell(0, 6, f"ID: {item_id} (Flagged by: {models})", new_x="LMARGIN", new_y="NEXT")
+        
+        pdf.set_font("helvetica", size=10)
+        explanation = item.get("explanation")
+        if explanation:
+            if explanation.get("type") == "image":
+                pdf.cell(0, 6, "  Explanation: Latent Space Divergence detected in ResNet-18 features.", new_x="LMARGIN", new_y="NEXT")
+            elif explanation.get("type") == "tabular":
+                top_features = ", ".join([c["name"] for c in explanation.get("top_contributors", [])])
+                pdf.cell(0, 6, f"  Explanation: High reconstruction error in features: {top_features}", new_x="LMARGIN", new_y="NEXT")
+            elif explanation.get("type") == "text":
+                col_name = explanation.get("column", "Unknown")
+                pdf.cell(0, 6, f"  Explanation: High Semantic Deviation in text column '{col_name}'.", new_x="LMARGIN", new_y="NEXT")
+        else:
+            pdf.cell(0, 6, "  Explanation: None available.", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(2)
+        
+    return pdf.output()
+
 
 
 @app.post("/download-sanitized")
@@ -415,59 +544,75 @@ async def download_sanitized(
     request: Request,
     file: UploadFile = File(...),
     flagged_items: str = Form(...),
+    scan_results_json: str = Form("{}"),
 ):
     """
-    Accept the original file and a JSON list of flagged IDs.
-    Return a cleaned version with the flagged items removed.
+    Accept the original file, a JSON list of flagged IDs, and metadata.
+    Return a cleaned ZIP version with a generated PDF receipt included.
     """
-    content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > 1073741824:
-        raise HTTPException(status_code=413, detail="Dataset exceeds 1GB limit.")
+    import tempfile as _tf
 
     try:
         to_remove: list[str] = json.loads(flagged_items)
     except (json.JSONDecodeError, TypeError):
         raise HTTPException(status_code=400, detail="flagged_items must be valid JSON.")
 
+    try:
+        scan_results = json.loads(scan_results_json) if scan_results_json else {}
+    except json.JSONDecodeError:
+        scan_results = {}
+
     remove_set = set(to_remove)
     filename = (file.filename or "").lower()
-    raw = await file.read()
 
+    # Stream the upload to a temp file to avoid loading entire file into RAM
+    fd, src_temp_path = _tf.mkstemp(suffix=os.path.splitext(filename)[1])
     try:
+        with os.fdopen(fd, 'wb') as tmp_f:
+            while True:
+                chunk = await file.read(1024 * 1024 * 4)  # 4MB
+                if not chunk:
+                    break
+                tmp_f.write(chunk)
+
+        # Generate the receipt
+        pdf_bytes = _generate_pdf_receipt(scan_results, filename)
+
         # ── CSV path ──────────────────────────────────────────────────────
         if filename.endswith(".csv"):
-            df = pd.read_csv(io.BytesIO(raw))
-            # Row indices were stringified in the scan response
+            df = pd.read_csv(src_temp_path)
             mask = ~df.index.astype(str).isin(remove_set)
             clean_df = df.loc[mask]
 
-            buf = io.StringIO()
-            clean_df.to_csv(buf, index=False)
-            buf.seek(0)
+            file_id = uuid.uuid4().hex
+            out_path = os.path.join(_TEMP_UPLOADS_DIR, f"{file_id}.zip")
+            
+            with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as dst:
+                csv_buf = io.StringIO()
+                clean_df.to_csv(csv_buf, index=False)
+                dst.writestr(f"sanitized_{filename}", csv_buf.getvalue())
+                dst.writestr("Sanitization_Receipt.pdf", pdf_bytes)
 
-            return StreamingResponse(
-                iter([buf.getvalue()]),
-                media_type="text/csv",
-                headers={
-                    "Content-Disposition": "attachment; filename=sanitized_data.csv"
-                },
-            )
+            return {
+                "download_url": f"/pickup-sanitized/{file_id}",
+                "filename": f"sanitized_{filename}.zip"
+            }
 
         # ── ZIP path ──────────────────────────────────────────────────────
         if filename.endswith(".zip"):
-            with zipfile.ZipFile(io.BytesIO(raw)) as src:
-                out_buf = io.BytesIO()
+            file_id = uuid.uuid4().hex
+            out_path = os.path.join(_TEMP_UPLOADS_DIR, f"{file_id}.zip")
 
-                with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as dst:
+            with zipfile.ZipFile(src_temp_path) as src:
+                with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as dst:
+                    dst.writestr("Sanitization_Receipt.pdf", pdf_bytes)
                     for entry in src.namelist():
-                        # Skip directories, macOS junk
                         if entry.endswith("/") or entry.startswith("__MACOSX"):
                             continue
                         
                         basename = os.path.basename(entry)
                         
                         if entry.lower().endswith(".csv"):
-                            # Filter anomalies out of CSV rows using the mapped identifier
                             with src.open(entry) as f:
                                 df = pd.read_csv(f)
                                 
@@ -479,24 +624,57 @@ async def download_sanitized(
                             clean_df.to_csv(csv_buf, index=False)
                             dst.writestr(entry, csv_buf.getvalue())
                         else:
-                            # Apply full-file skipping for anomalous images
                             if basename in remove_set:
                                 continue
                             dst.writestr(entry, src.read(entry))
 
-            out_buf.seek(0)
-
-            return StreamingResponse(
-                out_buf,
-                media_type="application/zip",
-                headers={
-                    "Content-Disposition": "attachment; filename=sanitized_data.zip"
-                },
-            )
+            return {
+                "download_url": f"/pickup-sanitized/{file_id}",
+                "filename": f"sanitized_{filename}"
+            }
 
         raise HTTPException(status_code=400, detail="Unsupported file type.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
     finally:
-        _purge_temp_uploads()
+        # Always clean up the source temp file
+        if os.path.exists(src_temp_path):
+            os.remove(src_temp_path)
+
+def remove_file(path: str):
+    if os.path.exists(path):
+        os.remove(path)
+
+@app.get("/pickup-sanitized/{file_id}")
+async def pickup_sanitized(file_id: str, background_tasks: BackgroundTasks):
+    """
+    Serve the cleaned file directly from disk using the browser's native download manager.
+    Delete the file immediately after sending it to free up server space.
+    """
+    # SECURITY: Prevent path traversal — file_id must be a strict hex UUID
+    import re
+    if not re.fullmatch(r"[a-f0-9]{32}", file_id):
+        raise HTTPException(status_code=400, detail="Invalid file identifier.")
+
+    csv_path = os.path.join(_TEMP_UPLOADS_DIR, f"{file_id}.csv")
+    zip_path = os.path.join(_TEMP_UPLOADS_DIR, f"{file_id}.zip")
+    
+    if os.path.exists(csv_path):
+        target_path = csv_path
+        media_type = "text/csv"
+    elif os.path.exists(zip_path):
+        target_path = zip_path
+        media_type = "application/zip"
+    else:
+        raise HTTPException(status_code=404, detail="File has expired or does not exist.")
+        
+    background_tasks.add_task(remove_file, target_path)
+    
+    return FileResponse(
+        path=target_path,
+        media_type=media_type,
+        filename=os.path.basename(target_path)
+    )
 
 
 # ==========================================
@@ -527,9 +705,13 @@ distill_image = (
         "opencv-python-headless", 
         "pillow",
         "slowapi",
+        "fpdf2",
+        "sentence-transformers",
     )
     # Cache the 44MB ResNet-18 weights during image build to prevent cold-start latency
     .run_commands('python -c "from torchvision.models import resnet18, ResNet18_Weights; resnet18(weights=ResNet18_Weights.DEFAULT)"')
+    # Cache the all-MiniLM-L6-v2 model for text embedding
+    .run_commands('python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer(\'all-MiniLM-L6-v2\')"')
     # NEW MODAL 1.0 SYNTAX: Add local files directly to the image builder
     .add_local_file(
         os.path.join(backend_dir, "extractor.py"), remote_path="/root/extractor.py"

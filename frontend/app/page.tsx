@@ -46,7 +46,8 @@ interface TabularContributor {
 
 type Explanation =
   | { type: "image"; top_contributors: ImageContributor[]; error?: string }
-  | { type: "tabular"; top_contributors: TabularContributor[] };
+  | { type: "tabular"; top_contributors: TabularContributor[] }
+  | { type: "text"; snippet: string; column: string };
 
 interface FlaggedItem {
   id: string;
@@ -158,21 +159,20 @@ export default function HomePage() {
       const formData = new FormData();
       formData.append("file", file);
       formData.append("flagged_items", JSON.stringify(flaggedIds));
+      formData.append("scan_results_json", JSON.stringify(results));
 
-      const response = await axios.post(`${API_URL}/download-sanitized`, formData, {
-        responseType: "blob",
-      });
+      const response = await axios.post(`${API_URL}/download-sanitized`, formData);
 
-      const blob = new Blob([response.data]);
-      const blobUrl = window.URL.createObjectURL(blob);
+      const { download_url, filename } = response.data;
       const link = document.createElement("a");
-      link.href = blobUrl;
-      const extension = file.name.split(".").pop() || "";
-      link.setAttribute("download", `sanitized_${file.name.replace(`.${extension}`, "")}.${extension}`);
+      
+      const baseUrl = API_URL.endsWith('/') ? API_URL.slice(0, -1) : API_URL;
+      link.href = `${baseUrl}${download_url}`;
+      link.setAttribute("download", filename || "sanitized_data.zip");
+      
       document.body.appendChild(link);
       link.click();
       link.parentNode?.removeChild(link);
-      window.URL.revokeObjectURL(blobUrl);
     } catch (err: unknown) {
       if (axios.isAxiosError(err)) {
         setError(err.response?.data?.detail ?? err.message ?? "Download failed.");
@@ -718,6 +718,23 @@ export default function HomePage() {
                    <p className="mt-2 text-xs text-slate-500 text-center mx-auto">
                      Showing the top 3 column features contributing to the absolute reconstruction error.
                    </p>
+                </div>
+              )}
+
+              {selectedItem.explanation?.type === "text" && (
+                <div className="w-full flex flex-col gap-4">
+                   <h4 className="text-sm text-slate-400 text-center font-mono font-semibold uppercase tracking-wider mb-2">High Semantic Deviation</h4>
+                   <p className="text-xs text-sky-300 bg-sky-500/10 p-3 rounded-lg border border-sky-500/20 text-center mx-auto shadow-inner leading-relaxed max-w-2xl">
+                     This text snippet was flagged by the ensemble model for violating the expected semantic topography of the dataset.
+                   </p>
+                   <div className="relative mt-2 p-6 rounded-xl border border-slate-700 bg-[var(--color-surface-light)] shadow-sm max-w-2xl mx-auto w-full">
+                     <span className="absolute -top-3 left-4 bg-slate-800 text-xs font-mono font-bold text-slate-400 px-2 py-0.5 rounded border border-slate-700">
+                       Column: {selectedItem.explanation.column}
+                     </span>
+                     <blockquote className="text-slate-300 italic whitespace-pre-wrap text-sm border-l-4 border-cyan-500/50 pl-4 py-1">
+                       "{selectedItem.explanation.snippet}"
+                     </blockquote>
+                   </div>
                 </div>
               )}
 
