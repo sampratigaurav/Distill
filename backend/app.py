@@ -148,10 +148,23 @@ def _train_autoencoder(
                 break
 
     model.eval()
-    tensor_data_dev = tensor_data.to(device)
+    
+    # Chunk evaluation to prevent OOM
+    eval_loader = DataLoader(
+        TensorDataset(tensor_data), batch_size=BATCH_SIZE, shuffle=False
+    )
+    
+    all_recons = []
+    all_errors = []
+    
     with torch.no_grad():
-        reconstructions = model(tensor_data_dev).cpu().numpy()
-        errors = model.reconstruction_error(tensor_data_dev).cpu().numpy()
+        for (batch,) in eval_loader:
+            batch_dev = batch.to(device)
+            all_recons.append(model(batch_dev).cpu().numpy())
+            all_errors.append(model.reconstruction_error(batch_dev).cpu().numpy())
+            
+    reconstructions = np.concatenate(all_recons, axis=0)
+    errors = np.concatenate(all_errors, axis=0)
 
     return errors, reconstructions
 
@@ -200,8 +213,20 @@ def _train_deep_svdd(
                 break
 
     model.eval()
+    
+    # Chunk evaluation to prevent OOM
+    eval_loader = DataLoader(
+        TensorDataset(tensor_data), batch_size=BATCH_SIZE, shuffle=False
+    )
+    
+    all_distances = []
+    
     with torch.no_grad():
-        distances = model.anomaly_score(tensor_data_dev).cpu().numpy()
+        for (batch,) in eval_loader:
+            batch_dev = batch.to(device)
+            all_distances.append(model.anomaly_score(batch_dev).cpu().numpy())
+            
+    distances = np.concatenate(all_distances, axis=0)
 
     return distances
 
@@ -423,15 +448,29 @@ async def download_sanitized(
 
                 with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as dst:
                     for entry in src.namelist():
-                        # Skip directories, macOS junk, and flagged files
+                        # Skip directories, macOS junk
                         if entry.endswith("/") or entry.startswith("__MACOSX"):
                             continue
+                        
                         basename = os.path.basename(entry)
-                        if basename in remove_set:
-                            continue
-                        # Write using the sanitized basename to prevent path traversal
-                        # in the output archive.
-                        dst.writestr(basename, src.read(entry))
+                        
+                        if entry.lower().endswith(".csv"):
+                            # Filter anomalies out of CSV rows using the mapped identifier
+                            with src.open(entry) as f:
+                                df = pd.read_csv(f)
+                                
+                            row_identifiers = [f"{basename}:row_{i}" for i in range(len(df))]
+                            mask = [rid not in remove_set for rid in row_identifiers]
+                            clean_df = df.iloc[mask]
+                            
+                            csv_buf = io.StringIO()
+                            clean_df.to_csv(csv_buf, index=False)
+                            dst.writestr(entry, csv_buf.getvalue())
+                        else:
+                            # Apply full-file skipping for anomalous images
+                            if basename in remove_set:
+                                continue
+                            dst.writestr(entry, src.read(entry))
 
             out_buf.seek(0)
 

@@ -126,7 +126,8 @@ class UniversalExtractor:
         # --- Numerical columns ---
         if num_cols:
             num_df = df[num_cols].copy()
-            num_df = num_df.fillna(num_df.mean())
+            # Handle partial missing values with column mean, and all-NaN cols with 0.0
+            num_df = num_df.fillna(num_df.mean()).fillna(0.0)
             scaler = StandardScaler()
             parts.append(scaler.fit_transform(num_df.values))
             self.last_columns.extend(num_cols)
@@ -136,14 +137,17 @@ class UniversalExtractor:
             cat_dict = {}
             for col in cat_cols:
                 col_series = df[col]
+                if col_series.nunique() > 100:
+                    continue
                 mode_val = col_series.mode()
                 fill_val = mode_val.iloc[0] if not mode_val.empty else "MISSING"
                 cat_dict[col] = col_series.fillna(fill_val)
                 
-            cat_df = pd.DataFrame(cat_dict)
-            encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
-            parts.append(encoder.fit_transform(cat_df.values))
-            self.last_columns.extend(list(encoder.get_feature_names_out(cat_cols)))
+            if cat_dict:
+                cat_df = pd.DataFrame(cat_dict)
+                encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
+                parts.append(encoder.fit_transform(cat_df.values))
+                self.last_columns.extend(list(encoder.get_feature_names_out(cat_df.columns)))
 
         if not parts:
             raise HTTPException(
