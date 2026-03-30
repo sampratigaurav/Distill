@@ -107,7 +107,9 @@ def get_binary_votes(raw_scores: np.ndarray, n_samples: int) -> np.ndarray:
     mad = np.maximum(mad, 1e-5) # Prevent zero-division
     
     mod_z_scores = 0.6745 * (raw_scores - median) / mad
-    threshold = 2.0 if n_samples < 200 else 3.5
+    
+    # FIX: Increased from 2.0 to 3.0 for small datasets to prevent false positives on clean data
+    threshold = 3.0 if n_samples < 200 else 3.5
     return (mod_z_scores > threshold).astype(np.int32)
 
 
@@ -233,9 +235,8 @@ def _train_deep_svdd(
 
 def _run_isolation_forest(feature_vectors: np.ndarray) -> np.ndarray:
     """Fit an IsolationForest and return continuous anomaly scores."""
-    # Strict dynamic contamination for small datasets
-    contam = max(0.001, min(0.05, 10.0 / len(feature_vectors)))
-    iso = IsolationForest(contamination=contam, random_state=42)
+    # FIX: Use auto contamination instead of a forced mathematical quota
+    iso = IsolationForest(contamination='auto', random_state=42)
     iso.fit(feature_vectors)
     
     # Sklearn decision_function returns negative values for outliers
