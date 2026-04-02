@@ -85,6 +85,13 @@ const MODEL_COLORS: Record<string, { bg: string; text: string; bar: string }> = 
 };
 const DEFAULT_MODEL_STYLE = { bg: "bg-red-500/10", text: "text-red-500", bar: "#ef4444" };
 
+const SEVERITY_COLORS = {
+    CRITICAL: { bg:"bg-red-500/20",    text:"text-red-400",    border:"border-red-500" },
+    HIGH:     { bg:"bg-orange-500/20", text:"text-orange-400", border:"border-orange-500" },
+    MEDIUM:   { bg:"bg-yellow-500/20", text:"text-yellow-400", border:"border-yellow-500" },
+    LOW:      { bg:"bg-zinc-500/20",   text:"text-zinc-400",   border:"border-zinc-600" },
+};
+
 /** Tooltip style shared across all charts */
 const TOOLTIP_STYLE = {
   backgroundColor: "#18181b", // zinc-900
@@ -278,7 +285,8 @@ export default function HomePage() {
 
   const filteredItems = results
     ? results.flagged_items.filter((item) =>
-        item.id.toLowerCase().includes(filterQuery.toLowerCase())
+        item.id.toLowerCase().includes(filterQuery.toLowerCase()) ||
+        item.severity.toLowerCase().includes(filterQuery.toLowerCase())
       )
     : [];
 
@@ -652,6 +660,22 @@ export default function HomePage() {
                   </div>
                 </div>
 
+                {results.confidence_distribution && (
+                    <div className="flex gap-2 mb-3">
+                        {Object.entries(results.confidence_distribution).map(([sev, count]) => 
+                            count > 0 && (
+                                <span key={sev} 
+                                    className={`font-mono text-[8px] font-bold px-1.5 py-0.5 
+                                    border ${SEVERITY_COLORS[sev as keyof typeof SEVERITY_COLORS].border}
+                                    ${SEVERITY_COLORS[sev as keyof typeof SEVERITY_COLORS].bg}
+                                    ${SEVERITY_COLORS[sev as keyof typeof SEVERITY_COLORS].text}`}>
+                                    {sev}: {count}
+                                </span>
+                            )
+                        )}
+                    </div>
+                )}
+
                 <div className="flex-1 overflow-y-auto max-h-72 flex flex-col gap-px">
                   {filteredItems.length === 0 ? (
                     <p className="font-mono text-[10px] text-zinc-600 text-center py-8 uppercase tracking-wider">
@@ -672,6 +696,26 @@ export default function HomePage() {
                         <span className="font-mono text-zinc-400 truncate text-[10px] flex-1">
                           {item.id}
                         </span>
+                        
+                        {/* Confidence bar */}
+                        <div className="flex items-center gap-1.5 shrink-0">
+                            <div className="w-16 h-1 bg-zinc-800 rounded-none overflow-hidden">
+                                <div 
+                                    className="h-full transition-none"
+                                    style={{ 
+                                        width: `${(item.confidence * 100).toFixed(0)}%`,
+                                        backgroundColor: item.severity === 'CRITICAL' ? '#ef4444' 
+                                            : item.severity === 'HIGH' ? '#f97316'
+                                            : item.severity === 'MEDIUM' ? '#eab308' 
+                                            : '#71717a'
+                                    }}
+                                />
+                            </div>
+                            <span className={`font-mono text-[9px] font-bold ${SEVERITY_COLORS[item.severity].text}`}>
+                                {(item.confidence * 100).toFixed(0)}%
+                            </span>
+                        </div>
+
                         <div className="flex items-center gap-1 shrink-0 flex-wrap justify-end">
                           {item.flagged_by.map((model) => {
                             const style = MODEL_COLORS[model] ?? DEFAULT_MODEL_STYLE;
@@ -721,6 +765,24 @@ export default function HomePage() {
             </div>
 
             <div className="p-6 overflow-y-auto max-h-[80vh]">
+              <div className="grid grid-cols-3 gap-px bg-zinc-800 mb-4">
+                  {Object.entries(selectedItem.model_scores).map(([model, score]) => (
+                      score !== null && (
+                          <div key={model} className="bg-zinc-900 p-3">
+                              <p className="font-mono text-[9px] text-zinc-500 uppercase 
+                                  tracking-wider mb-1">{model}</p>
+                              <p className="font-mono text-lg font-bold text-white">
+                                  {((score ?? 0) * 100).toFixed(1)}%
+                              </p>
+                              <div className="w-full h-0.5 bg-zinc-800 mt-1.5">
+                                  <div className="h-full bg-orange-500" 
+                                      style={{width:`${(score??0)*100}%`}}/>
+                              </div>
+                          </div>
+                      )
+                  ))}
+              </div>
+              
               {/* Image XAI */}
               {selectedItem.explanation?.type === "image" && (
                 <div className="w-full flex flex-col gap-4">

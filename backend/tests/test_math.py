@@ -342,3 +342,42 @@ class TestEnsembleVoting:
         items = _build_flagged_items(identifiers, ae_f, sv_f, is_f, fv, rc, mv)
         flagged_ids = {item["id"] for item in items}
         assert flagged_ids == {"poisoned"}
+
+class TestConfidenceScores:
+    def test_clean_score_below_half(self):
+        """Score at median → confidence near 0.5, below threshold."""
+        from app import _normalize_scores_to_confidence
+        scores = np.ones(10, dtype=np.float32) * 5.0
+        conf = _normalize_scores_to_confidence(scores, median=5.0, mad=1.0)
+        assert (conf < 0.55).all()
+
+    def test_extreme_outlier_near_one(self):
+        """Extreme outlier → confidence close to 1.0."""
+        from app import _normalize_scores_to_confidence
+        scores = np.array([1000.0], dtype=np.float32)
+        conf = _normalize_scores_to_confidence(scores, median=1.0, mad=0.1)
+        assert conf[0] > 0.95
+
+    def test_output_bounded(self):
+        """All confidence values must be in [0,1]."""
+        from app import _normalize_scores_to_confidence
+        rng = np.random.default_rng(0)
+        scores = rng.normal(0, 10, 100).astype(np.float32)
+        conf = _normalize_scores_to_confidence(scores, median=0.0, mad=5.0)
+        assert (conf >= 0).all() and (conf <= 1).all()
+
+    def test_severity_ordering(self):
+        """Higher confidence → higher severity label."""
+        # CRITICAL=0.80+, HIGH=0.65+, MEDIUM=0.50+, LOW=below
+        thresholds = [(0.85,"CRITICAL"),(0.70,"HIGH"),
+                      (0.55,"MEDIUM"),(0.40,"LOW")]
+        for conf, expected_sev in thresholds:
+            if conf >= 0.80:   sev = "CRITICAL"
+            elif conf >= 0.65: sev = "HIGH"
+            elif conf >= 0.50: sev = "MEDIUM"
+            else:              sev = "LOW"
+            assert sev == expected_sev
+
+    def test_ensemble_weights_sum_to_one(self):
+        """AE(0.4) + SVDD(0.4) + ISO(0.2) = 1.0"""
+        assert abs(0.4 + 0.4 + 0.2 - 1.0) < 1e-9

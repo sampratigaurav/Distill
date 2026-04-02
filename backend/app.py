@@ -516,6 +516,21 @@ def _purge_temp_uploads() -> None:
 
 
 
+def _normalize_scores_to_confidence(
+    raw_scores: np.ndarray,
+    median: float,
+    mad: float,
+) -> np.ndarray:
+    """
+    Convert raw anomaly scores to [0,1] confidence using sigmoid
+    on modified Z-scores. 0=definitely clean, 1=definitely poisoned.
+    """
+    mod_z = 0.6745 * (raw_scores - median) / max(mad, 1e-5)
+    # Sigmoid centered at threshold=0, scale=0.5 gives smooth curve
+    confidence = 1.0 / (1.0 + np.exp(-0.5 * mod_z))
+    return confidence.astype(np.float32)
+
+
 def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
     # 2. Extract Chunk 0 (The Base Pattern)
     first_features, first_identifiers = next(data_stream)
@@ -554,20 +569,6 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
     raw_svdd = _evaluate_deep_svdd(svdd_model, chunk0_tensor)
     raw_iso = _evaluate_isolation_forest(iso_model, first_features, pca)
     
-    def _normalize_scores_to_confidence(
-        raw_scores: np.ndarray,
-        median: float,
-        mad: float,
-    ) -> np.ndarray:
-        """
-        Convert raw anomaly scores to [0,1] confidence using sigmoid
-        on modified Z-scores. 0=definitely clean, 1=definitely poisoned.
-        """
-        mod_z = 0.6745 * (raw_scores - median) / max(mad, 1e-5)
-        # Sigmoid centered at threshold=0, scale=0.5 gives smooth curve
-        confidence = 1.0 / (1.0 + np.exp(-0.5 * mod_z))
-        return confidence.astype(np.float32)
-
     # Freeze thresholds using Chunk 0 topography
     chunk0_len = len(first_features)
     contam = max(0.001, min(0.05, 10.0 / chunk0_len)) if chunk0_len > 0 else 0.05
