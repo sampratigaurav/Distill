@@ -175,8 +175,8 @@ def _statistical_prefilter(
 ) -> np.ndarray:
     """
     Returns boolean mask (True=hard anomaly) using:
-    1. Per-column modified Z-score > 5.0 (5-sigma rule)
-    2. IQR fence: value < Q1 - 3*IQR or > Q3 + 3*IQR
+    1. Per-column modified Z-score > 6.0 (6-sigma rule)
+    2. IQR fence: value < Q1 - 4*IQR or > Q3 + 4*IQR
     3. Any row triggering EITHER rule on ANY column → hard anomaly
     """
     n, d = features.shape
@@ -190,13 +190,13 @@ def _statistical_prefilter(
         mad = np.median(np.abs(col - median))
         mad = max(mad, 1e-5)
         mod_z = 0.6745 * np.abs(col - median) / mad
-        hard_flags |= (mod_z > 5.0)
+        hard_flags |= (mod_z > 6.0)
         
-        # IQR fence (3x = extreme outlier, not just mild)
+        # IQR fence (4x = extreme outlier, not just mild)
         q1, q3 = np.percentile(col, [25, 75])
         iqr = q3 - q1
         if iqr > 1e-5:
-            hard_flags |= (col < q1 - 3*iqr) | (col > q3 + 3*iqr)
+            hard_flags |= (col < q1 - 4*iqr) | (col > q3 + 4*iqr)
     
     return hard_flags
 
@@ -559,7 +559,15 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
         chunk_len = len(features)
         total_samples += chunk_len
         
-        hard_flags = _statistical_prefilter(features, identifiers, extractor.last_columns)
+        # Only run statistical prefilter on tabular data
+        # For image embeddings (dim>=512) or NLP embeddings, skip it —
+        # embedding dimensions have no interpretable column semantics
+        # and the IQR/Z-score logic produces massive false positives
+        # on high-dimensional latent spaces with small sample counts.
+        if extractor.last_images or input_dim >= 384:
+            hard_flags = np.zeros(len(identifiers), dtype=bool)
+        else:
+            hard_flags = _statistical_prefilter(features, identifiers, extractor.last_columns)
         mask = ~hard_flags
         ml_features = features[mask]
         
