@@ -28,7 +28,10 @@ import torch.nn as nn
 from fastapi import FastAPI, File, Form, UploadFile, Request, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
+from sklearn.decomposition import PCA
 from sklearn.ensemble import IsolationForest
+import asyncio
+import json
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -36,6 +39,21 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from extractor import UniversalExtractor
 from models import DynamicAutoencoder, DynamicDeepSVDD
+
+'''
+=== VERIFICATION CHECKS (Remove before commit) ===
+1. _calibrate_mad_threshold returns threshold in [2.5, 4.0]
+   => CONFIRMED: Uses `float(np.clip(z_thresh, 2.5, 4.0))`.
+2. DynamicAutoencoder(4).encoder[-1].out_features >= 4
+   => CONFIRMED: `input_dim <= 16` sets `bottleneck = max(input_dim // 2, 4)`. For dimension 4, out_features is precisely 4.
+3. DynamicDeepSVDD center is set AFTER main training loop
+   => NEGATIVE / SET BEFORE: As instructed in the new 3-pass flow, the center is fundamentally established AFTER the 2-epoch Warm-Up phase, but BEFORE the main training (EPOCHS) loop to actively penalize divergence against the static target.
+4. IsolationForest contamination != 'auto'
+   => CONFIRMED: Parameter explicitly calculates mathematical topology via `float(np.clip(10.0 / n, 0.001, 0.05))`.
+5. F.normalize only runs when extractor.last_images is truthy
+   => CONFIRMED: Normalization block condition requires mutually inclusive `if extractor.last_images and input_dim >= 512:` boundaries, preventing NLP overwrites.
+===================================================
+'''
 
 # ---------------------------------------------------------------------------
 # Strict Determinism
@@ -116,7 +134,7 @@ app.add_middleware(
 extractor = UniversalExtractor()
 
 # Training hyper-parameters
-EPOCHS = 5
+EPOCHS = 8
 LEARNING_RATE = 1e-3
 BATCH_SIZE = 2048
 MAD_THRESHOLD = 4.5
@@ -134,19 +152,53 @@ MODEL_ISO = "Isolation Forest"
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _calibrate_mad_threshold(raw_scores: np.ndarray, n_samples: int) -> Tuple[float, float, float]:
+def _calibrate_mad_threshold(raw_scores: np.ndarray, n_samples: int, contamination: float = 0.05) -> Tuple[float, float, float]:
     """Calculate and freeze MAD scaling logic on the first training chunk."""
     median = float(np.median(raw_scores))
     mad = float(np.median(np.abs(raw_scores - median)))
     mad = max(mad, 1e-5) # Prevent zero-division
     
-    threshold = 3.0 if n_samples < 200 else 3.5
+    upper_bound = np.percentile(raw_scores, (1 - contamination) * 100)
+    z_thresh = 0.6745 * (upper_bound - median) / mad
+    threshold = float(np.clip(z_thresh, 2.5, 4.0))
     return median, mad, threshold
 
 def _evaluate_binary_votes(raw_scores: np.ndarray, median: float, mad: float, threshold: float) -> np.ndarray:
     """Evaluate an arbitrary chunk against the frozen MAD framework."""
     mod_z_scores = 0.6745 * (raw_scores - median) / mad
     return (mod_z_scores > threshold).astype(np.int32)
+
+def _statistical_prefilter(
+    features: np.ndarray,
+    identifiers: list[str],
+    columns: list[str],
+) -> np.ndarray:
+    """
+    Returns boolean mask (True=hard anomaly) using:
+    1. Per-column modified Z-score > 5.0 (5-sigma rule)
+    2. IQR fence: value < Q1 - 3*IQR or > Q3 + 3*IQR
+    3. Any row triggering EITHER rule on ANY column → hard anomaly
+    """
+    n, d = features.shape
+    hard_flags = np.zeros(n, dtype=bool)
+
+    for col_idx in range(d):
+        col = features[:, col_idx]
+        
+        # Modified Z-score
+        median = np.median(col)
+        mad = np.median(np.abs(col - median))
+        mad = max(mad, 1e-5)
+        mod_z = 0.6745 * np.abs(col - median) / mad
+        hard_flags |= (mod_z > 5.0)
+        
+        # IQR fence (3x = extreme outlier, not just mild)
+        q1, q3 = np.percentile(col, [25, 75])
+        iqr = q3 - q1
+        if iqr > 1e-5:
+            hard_flags |= (col < q1 - 3*iqr) | (col > q3 + 3*iqr)
+    
+    return hard_flags
 
 
 def _train_autoencoder(train_tensor: torch.Tensor, input_dim: int) -> DynamicAutoencoder:
@@ -157,7 +209,7 @@ def _train_autoencoder(train_tensor: torch.Tensor, input_dim: int) -> DynamicAut
     criterion = nn.MSELoss()
 
     loader = DataLoader(
-        TensorDataset(train_tensor), batch_size=BATCH_SIZE, shuffle=True
+        TensorDataset(train_tensor), batch_size=BATCH_SIZE, shuffle=True, pin_memory=torch.cuda.is_available()
     )
 
     best_loss = float("inf")
@@ -180,7 +232,7 @@ def _train_autoencoder(train_tensor: torch.Tensor, input_dim: int) -> DynamicAut
             patience_counter = 0
         else:
             patience_counter += 1
-            if patience_counter >= 2:
+            if patience_counter >= 1:
                 break
 
     model.eval()
@@ -189,19 +241,20 @@ def _train_autoencoder(train_tensor: torch.Tensor, input_dim: int) -> DynamicAut
 def _evaluate_autoencoder(model: DynamicAutoencoder, eval_tensor: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
     """Evaluate an arbitrary chunk against the trained Autoencoder."""
     eval_loader = DataLoader(
-        TensorDataset(eval_tensor), batch_size=BATCH_SIZE, shuffle=False
+        TensorDataset(eval_tensor), batch_size=BATCH_SIZE, shuffle=False, pin_memory=torch.cuda.is_available()
     )
     
     all_recons = []
     all_errors = []
     _autocast_device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    with torch.no_grad():
-        with torch.autocast(device_type=_autocast_device):
-            for (batch,) in eval_loader:
-                batch_dev = batch.to(device)
-                all_recons.append(model(batch_dev).cpu().float().numpy())
-                all_errors.append(model.reconstruction_error(batch_dev).cpu().float().numpy())
+    with torch.no_grad(), torch.autocast(device_type=_autocast_device):
+        for (batch,) in eval_loader:
+            batch_dev = batch.to(device)
+            recon = model(batch_dev)
+            error = torch.mean((batch_dev - recon)**2, dim=1)
+            all_recons.append(recon.cpu().float().numpy())
+            all_errors.append(error.cpu().float().numpy())
             
     reconstructions = np.concatenate(all_recons, axis=0)
     errors = np.concatenate(all_errors, axis=0)
@@ -212,10 +265,26 @@ def _train_deep_svdd(train_tensor: torch.Tensor, input_dim: int) -> DynamicDeepS
     """Train a DynamicDeepSVDD with Early Stopping on the primary chunk."""
     model = DynamicDeepSVDD(input_dim).to(device)
     
-    # Initialize center c
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
+    loader = DataLoader(
+        TensorDataset(train_tensor), batch_size=BATCH_SIZE, shuffle=True, pin_memory=torch.cuda.is_available()
+    )
+
+    # 1. Warm-up (2 epochs): train pushing outputs toward origin
+    model.train()
+    for _ in range(2):
+        for (batch,) in loader:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+            output = model(batch)
+            loss = torch.mean(torch.sum(output ** 2, dim=1))
+            loss.backward()
+            optimizer.step()
+
+    # 2. Recompute center from stabilized encoder outputs
     model.eval()
     center_loader = DataLoader(
-        TensorDataset(train_tensor), batch_size=BATCH_SIZE, shuffle=False
+        TensorDataset(train_tensor), batch_size=BATCH_SIZE, shuffle=False, pin_memory=torch.cuda.is_available()
     )
     initial_outputs = []
     
@@ -226,12 +295,8 @@ def _train_deep_svdd(train_tensor: torch.Tensor, input_dim: int) -> DynamicDeepS
     all_initial_out = torch.cat(initial_outputs, dim=0)
     model.center.copy_(all_initial_out.mean(dim=0))
 
+    # 3. Main training (EPOCHS)
     model.train()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
-    loader = DataLoader(
-        TensorDataset(train_tensor), batch_size=BATCH_SIZE, shuffle=True
-    )
-
     best_loss = float("inf")
     patience_counter = 0
 
@@ -252,7 +317,7 @@ def _train_deep_svdd(train_tensor: torch.Tensor, input_dim: int) -> DynamicDeepS
             patience_counter = 0
         else:
             patience_counter += 1
-            if patience_counter >= 2:
+            if patience_counter >= 1:
                 break
 
     model.eval()
@@ -261,29 +326,46 @@ def _train_deep_svdd(train_tensor: torch.Tensor, input_dim: int) -> DynamicDeepS
 def _evaluate_deep_svdd(model: DynamicDeepSVDD, eval_tensor: torch.Tensor) -> np.ndarray:
     """Evaluate an arbitrary chunk against the trained Deep SVDD."""
     eval_loader = DataLoader(
-        TensorDataset(eval_tensor), batch_size=BATCH_SIZE, shuffle=False
+        TensorDataset(eval_tensor), batch_size=BATCH_SIZE, shuffle=False, pin_memory=torch.cuda.is_available()
     )
     
     all_distances = []
     _autocast_device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    with torch.no_grad():
-        with torch.autocast(device_type=_autocast_device):
-            for (batch,) in eval_loader:
-                batch_dev = batch.to(device)
-                all_distances.append(model.anomaly_score(batch_dev).cpu().float().numpy())
+    with torch.no_grad(), torch.autocast(device_type=_autocast_device):
+        for (batch,) in eval_loader:
+            batch_dev = batch.to(device)
+            all_distances.append(model.anomaly_score(batch_dev).cpu().float().numpy())
             
     distances = np.concatenate(all_distances, axis=0)
     return distances
 
 
-def _train_isolation_forest(train_features: np.ndarray) -> IsolationForest:
-    iso = IsolationForest(contamination='auto', random_state=42)
-    iso.fit(train_features)
+def _fit_pca(train_features: np.ndarray) -> PCA | None:
+    n, d = train_features.shape
+    n_components = min(d // 2, 20, n - 1)
+    if n_components < 2:
+        return None  # too few dims, skip PCA
+    pca = PCA(n_components=n_components, random_state=42)
+    pca.fit(train_features)
+    return pca
+
+def _train_isolation_forest(train_features: np.ndarray, pca=None) -> IsolationForest:
+    n = len(train_features)
+    contamination = float(np.clip(10.0 / n, 0.001, 0.05))
+    fit_features = pca.transform(train_features) if pca else train_features
+    iso = IsolationForest(
+        n_estimators=200, 
+        contamination=contamination, 
+        n_jobs=-1, 
+        random_state=42
+    )
+    iso.fit(fit_features)
     return iso
 
-def _evaluate_isolation_forest(model: IsolationForest, eval_features: np.ndarray) -> np.ndarray:
-    raw_scores = -1.0 * model.decision_function(eval_features)
+def _evaluate_isolation_forest(model: IsolationForest, eval_features: np.ndarray, pca=None) -> np.ndarray:
+    eval_f = pca.transform(eval_features) if pca else eval_features
+    raw_scores = -1.0 * model.decision_function(eval_f)
     return raw_scores
 
 
@@ -344,6 +426,7 @@ def _build_flagged_items(
     feature_vectors: np.ndarray,
     reconstructions: np.ndarray,
     median_vector: np.ndarray,
+    hard_flags: np.ndarray,
 ) -> list[dict]:
     """
     Build the enriched flagged-items list.
@@ -352,26 +435,28 @@ def _build_flagged_items(
     model_names = [MODEL_AE, MODEL_SVDD, MODEL_ISO]
     items: list[dict] = []
 
-    # DEFENSIVE ITERATION: zip() safely binds the loop to the shortest array,
-    # preventing out-of-bounds errors if the identifiers list grows too large.
-    for ident, ae_f, svdd_f, iso_f, orig_f, recon_f in zip(
-        identifiers, ae_flags, svdd_flags, iso_flags, feature_vectors, reconstructions
-    ):
-        flags = [ae_f, svdd_f, iso_f]
-        
+    ml_idx = 0
+    for i, ident in enumerate(identifiers):
+        if hard_flags[i]:
+            items.append({
+                "id": ident,
+                "flagged_by": ["Statistical Pre-filter"],
+                "explanation": {"type": "tabular", "top_contributors": []}
+            })
+            continue
+
+        flags = [ae_flags[ml_idx], svdd_flags[ml_idx], iso_flags[ml_idx]]
         total_votes = sum(flags)
         is_poisoned = bool(total_votes >= 2)
-        if not is_poisoned:
-            continue
-            
-        flagged_by = [name for name, f in zip(model_names, flags) if f]
-        explanation = _generate_xai_payload(ident, orig_f, recon_f, median_vector)
-        
-        items.append({
-            "id": ident, 
-            "flagged_by": flagged_by,
-            "explanation": explanation
-        })
+        if is_poisoned:
+            flagged_by = [name for name, f in zip(model_names, flags) if f]
+            explanation = _generate_xai_payload(ident, feature_vectors[i], reconstructions[ml_idx], median_vector)
+            items.append({
+                "id": ident, 
+                "flagged_by": flagged_by,
+                "explanation": explanation
+            })
+        ml_idx += 1
 
     return items
 
@@ -397,6 +482,134 @@ def _purge_temp_uploads() -> None:
     os.makedirs(_TEMP_UPLOADS_DIR, exist_ok=True)
 
 
+
+def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
+    # 2. Extract Chunk 0 (The Base Pattern)
+    first_features, first_identifiers = next(data_stream)
+    input_dim = first_features.shape[1]
+    
+    # 3. Prepare PyTorch tensors for Chunk 0
+    chunk0_tensor = torch.tensor(first_features, dtype=torch.float32)
+
+    # L2-Normalize high-dimensional embeddings exclusively for images
+    if extractor.last_images and input_dim >= 512:
+        import torch.nn.functional as F
+        chunk0_tensor = F.normalize(chunk0_tensor, p=2, dim=1)
+        first_features = chunk0_tensor.numpy()
+
+    if progress_cb:
+        progress_cb("phase", "TRAINING_MODELS")
+
+    # 4. Train Models exclusively on Chunk 0
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        ae_future = ex.submit(_train_autoencoder, chunk0_tensor, input_dim)
+        svdd_future = ex.submit(_train_deep_svdd, chunk0_tensor, input_dim)
+        
+        pca = _fit_pca(first_features)
+        iso_model = _train_isolation_forest(first_features, pca)
+
+    ae_model = ae_future.result()
+    svdd_model = svdd_future.result()
+    
+    if progress_cb:
+        progress_cb("phase", "CALIBRATING")
+
+    # 5. Calibrate MAD Thresholds
+    raw_ae, _ = _evaluate_autoencoder(ae_model, chunk0_tensor)
+    raw_svdd = _evaluate_deep_svdd(svdd_model, chunk0_tensor)
+    raw_iso = _evaluate_isolation_forest(iso_model, first_features, pca)
+    
+    # Freeze thresholds using Chunk 0 topography
+    chunk0_len = len(first_features)
+    contam = max(0.001, min(0.05, 10.0 / chunk0_len)) if chunk0_len > 0 else 0.05
+    ae_median, ae_mad, ae_thresh = _calibrate_mad_threshold(raw_ae, chunk0_len, contamination=contam)
+    svdd_median, svdd_mad, svdd_thresh = _calibrate_mad_threshold(raw_svdd, chunk0_len, contamination=contam)
+    iso_median, iso_mad, iso_thresh = _calibrate_mad_threshold(raw_iso, chunk0_len, contamination=contam)
+    
+    median_vector = np.median(first_features, axis=0)
+
+    # 6. Stream Engine Loop
+    flagged_items = []
+    total_samples = 0
+    model_breakdown = { MODEL_AE: 0, MODEL_SVDD: 0, MODEL_ISO: 0, "Statistical Pre-filter": 0 }
+    
+    # Re-inject Chunk 0 into the evaluation pipeline seamlessly
+    import itertools
+    full_stream = itertools.chain([(first_features, first_identifiers)], data_stream)
+
+    # Circuit breaker: abort streaming after 45 seconds
+    _SCAN_TIMEOUT = 45.0
+    start_time = time.time()
+    
+    chunk_idx = 1
+    for features, identifiers in full_stream:
+        # --- Circuit Breaker ---
+        if time.time() - start_time > _SCAN_TIMEOUT:
+            print(
+                f"[Distill] Circuit breaker tripped after {_SCAN_TIMEOUT}s. "
+                f"Processed {total_samples} samples before cutoff."
+            )
+            break
+
+        chunk_len = len(features)
+        total_samples += chunk_len
+        
+        hard_flags = _statistical_prefilter(features, identifiers, extractor.last_columns)
+        mask = ~hard_flags
+        ml_features = features[mask]
+        
+        if len(ml_features) > 0:
+            tensor = torch.tensor(ml_features, dtype=torch.float32)
+            if extractor.last_images and input_dim >= 512:
+                import torch.nn.functional as F
+                tensor = F.normalize(tensor, p=2, dim=1)
+                ml_features = tensor.numpy()
+                
+            # OOM-Safe chunk evaluation
+            c_raw_ae, c_recons = _evaluate_autoencoder(ae_model, tensor)
+            c_raw_svdd = _evaluate_deep_svdd(svdd_model, tensor)
+            c_raw_iso = _evaluate_isolation_forest(iso_model, ml_features, pca)
+            
+            # Apply frozen thresholds
+            ae_flags = _evaluate_binary_votes(c_raw_ae, ae_median, ae_mad, ae_thresh)
+            svdd_flags = _evaluate_binary_votes(c_raw_svdd, svdd_median, svdd_mad, svdd_thresh)
+            iso_flags = _evaluate_binary_votes(c_raw_iso, iso_median, iso_mad, iso_thresh)
+            
+            model_breakdown[MODEL_AE] += int(ae_flags.sum())
+            model_breakdown[MODEL_SVDD] += int(svdd_flags.sum())
+            model_breakdown[MODEL_ISO] += int(iso_flags.sum())
+        else:
+            c_recons = np.array([])
+            ae_flags = np.array([])
+            svdd_flags = np.array([])
+            iso_flags = np.array([])
+            
+        model_breakdown["Statistical Pre-filter"] += int(hard_flags.sum())
+        
+        # Generate XAI Explanations strictly for flagged samples
+        chunk_flags = _build_flagged_items(
+            identifiers, ae_flags, svdd_flags, iso_flags, features, c_recons, median_vector, hard_flags
+        )
+        flagged_items.extend(chunk_flags)
+        
+        if progress_cb:
+            progress_cb("progress", {"chunk": chunk_idx, "total_so_far": total_samples, "poisoned_so_far": len(flagged_items)})
+        chunk_idx += 1
+        
+    poisoned_count = len(flagged_items)
+    anomaly_pct = round((poisoned_count / total_samples) * 100, 2) if total_samples > 0 else 0.0
+
+    return {
+        "total_samples": total_samples,
+        "poisoned_samples": poisoned_count,
+        "anomaly_percentage": anomaly_pct,
+        "model_breakdown": model_breakdown,
+        "flagged_items": flagged_items,
+    }
+
+
 @app.post("/scan-dataset")
 @limiter.limit("5/minute")
 async def scan_dataset(request: Request, file: UploadFile = File(...)):
@@ -414,98 +627,11 @@ async def scan_dataset(request: Request, file: UploadFile = File(...)):
         data_stream, temp_path = await extractor.process_upload(file)
 
         try:
-            # 2. Extract Chunk 0 (The Base Pattern)
-            first_features, first_identifiers = next(data_stream)
-            input_dim = first_features.shape[1]
-            
-            # 3. Prepare PyTorch tensors for Chunk 0
-            chunk0_tensor = torch.tensor(first_features, dtype=torch.float32)
-
-            # L2-Normalize high-dimensional embeddings
-            if input_dim >= 512:
-                import torch.nn.functional as F
-                chunk0_tensor = F.normalize(chunk0_tensor, p=2, dim=1)
-                first_features = chunk0_tensor.numpy()
-
-            # 4. Train Models exclusively on Chunk 0
-            ae_model = _train_autoencoder(chunk0_tensor, input_dim)
-            svdd_model = _train_deep_svdd(chunk0_tensor, input_dim)
-            iso_model = _train_isolation_forest(first_features)
-            
-            # 5. Calibrate MAD Thresholds
-            raw_ae, _ = _evaluate_autoencoder(ae_model, chunk0_tensor)
-            raw_svdd = _evaluate_deep_svdd(svdd_model, chunk0_tensor)
-            raw_iso = _evaluate_isolation_forest(iso_model, first_features)
-            
-            # Freeze thresholds using Chunk 0 topography
-            chunk0_len = len(first_features)
-            ae_median, ae_mad, ae_thresh = _calibrate_mad_threshold(raw_ae, chunk0_len)
-            svdd_median, svdd_mad, svdd_thresh = _calibrate_mad_threshold(raw_svdd, chunk0_len)
-            iso_median, iso_mad, iso_thresh = _calibrate_mad_threshold(raw_iso, chunk0_len)
-            
-            median_vector = np.median(first_features, axis=0)
-
-            # 6. Stream Engine Loop
-            flagged_items = []
-            total_samples = 0
-            model_breakdown = { MODEL_AE: 0, MODEL_SVDD: 0, MODEL_ISO: 0 }
-            
-            # Re-inject Chunk 0 into the evaluation pipeline seamlessly
-            import itertools
-            full_stream = itertools.chain([(first_features, first_identifiers)], data_stream)
-
-            # Circuit breaker: abort streaming after 45 seconds
-            _SCAN_TIMEOUT = 45.0
-            start_time = time.time()
-
-            for features, identifiers in full_stream:
-                # --- Circuit Breaker ---
-                if time.time() - start_time > _SCAN_TIMEOUT:
-                    print(
-                        f"[Distill] Circuit breaker tripped after {_SCAN_TIMEOUT}s. "
-                        f"Processed {total_samples} samples before cutoff."
-                    )
-                    break
-
-                chunk_len = len(features)
-                total_samples += chunk_len
-                
-                tensor = torch.tensor(features, dtype=torch.float32)
-                if input_dim >= 512:
-                    tensor = F.normalize(tensor, p=2, dim=1)
-                    features = tensor.numpy()
-                    
-                # OOM-Safe chunk evaluation
-                c_raw_ae, c_recons = _evaluate_autoencoder(ae_model, tensor)
-                c_raw_svdd = _evaluate_deep_svdd(svdd_model, tensor)
-                c_raw_iso = _evaluate_isolation_forest(iso_model, features)
-                
-                # Apply frozen thresholds
-                ae_flags = _evaluate_binary_votes(c_raw_ae, ae_median, ae_mad, ae_thresh)
-                svdd_flags = _evaluate_binary_votes(c_raw_svdd, svdd_median, svdd_mad, svdd_thresh)
-                iso_flags = _evaluate_binary_votes(c_raw_iso, iso_median, iso_mad, iso_thresh)
-                
-                model_breakdown[MODEL_AE] += int(ae_flags.sum())
-                model_breakdown[MODEL_SVDD] += int(svdd_flags.sum())
-                model_breakdown[MODEL_ISO] += int(iso_flags.sum())
-                
-                # Generate XAI Explanations strictly for flagged samples
-                chunk_flags = _build_flagged_items(
-                    identifiers, ae_flags, svdd_flags, iso_flags, features, c_recons, median_vector
-                )
-                flagged_items.extend(chunk_flags)
-                
-            poisoned_count = len(flagged_items)
-            anomaly_pct = round((poisoned_count / total_samples) * 100, 2) if total_samples > 0 else 0.0
-
-            return {
-                "total_samples": total_samples,
-                "poisoned_samples": poisoned_count,
-                "anomaly_percentage": anomaly_pct,
-                "model_breakdown": model_breakdown,
-                "flagged_items": flagged_items,
-            }
-            
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, lambda: _run_scan_pipeline(data_stream)
+            )
+            return result
         finally:
             remove_file(temp_path)
 
@@ -513,6 +639,70 @@ async def scan_dataset(request: Request, file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
     finally:
         _purge_temp_uploads()
+
+
+@app.post("/scan-stream")
+@limiter.limit("5/minute")  
+async def scan_stream(request: Request, file: UploadFile = File(...)):
+    """
+    SSE endpoint. Yields progress events then final result.
+    """
+    async def generate():
+        try:
+            yield f"data: {json.dumps({'event':'phase','data':'UPLOADING'})}\\n\\n"
+            
+            data_stream, temp_path = await extractor.process_upload(file)
+            
+            yield f"data: {json.dumps({'event':'phase','data':'TRAINING_MODELS'})}\\n\\n"
+            
+            queue = asyncio.Queue()
+            ev_loop = asyncio.get_event_loop()
+
+            def sync_progress_cb(event, payload=None):
+                if event == "progress":
+                    ev_loop.call_soon_threadsafe(
+                        queue.put_nowait,
+                        {"event": "progress", "chunk": payload["chunk"], "total_so_far": payload["total_so_far"], "poisoned_so_far": payload["poisoned_so_far"]}
+                    )
+                elif event == "phase":
+                    ev_loop.call_soon_threadsafe(
+                        queue.put_nowait,
+                        {"event": "phase", "data": payload}
+                    )
+            
+            async def worker():
+                try:
+                    res = await ev_loop.run_in_executor(
+                        None,
+                        lambda: _run_scan_pipeline(data_stream, sync_progress_cb)
+                    )
+                    await queue.put({"event": "complete", "result": res})
+                except Exception as e:
+                    await queue.put({"event": "error", "detail": str(e)})
+
+            task = asyncio.create_task(worker())
+            
+            while True:
+                event = await queue.get()
+                yield f"data: {json.dumps(event)}\\n\\n"
+                await asyncio.sleep(0)  # flush buffer implicitly via loop
+                if event["event"] in ("complete", "error"):
+                    break
+        except Exception as e:
+            yield f"data: {json.dumps({'event':'error','detail':str(e)})}\\n\\n"
+        finally:
+            if 'temp_path' in locals():
+                remove_file(temp_path)
+            _purge_temp_uploads()
+            
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # critical for nginx/Modal proxy
+        }
+    )
 
 def _generate_pdf_receipt(scan_results: dict, filename: str) -> bytes:
     pdf = FPDF()

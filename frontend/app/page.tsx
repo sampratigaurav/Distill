@@ -74,9 +74,10 @@ const CHART_COLORS = { clean: "#22c55e", poisoned: "#ef4444" };
 
 /** Per-model colors — orange / red / zinc monochrome palette */
 const MODEL_COLORS: Record<string, { bg: string; text: string; bar: string }> = {
-  Autoencoder:        { bg: "bg-orange-500/10", text: "text-orange-500", bar: "#f97316" },
-  "Deep SVDD":        { bg: "bg-red-500/10",    text: "text-red-500",    bar: "#ef4444" },
-  "Isolation Forest": { bg: "bg-zinc-500/10",   text: "text-zinc-300",   bar: "#d4d4d8" },
+  Autoencoder:              { bg: "bg-orange-500/10", text: "text-orange-500", bar: "#f97316" },
+  "Deep SVDD":              { bg: "bg-red-500/10",    text: "text-red-500",    bar: "#ef4444" },
+  "Isolation Forest":       { bg: "bg-zinc-500/10",   text: "text-zinc-300",   bar: "#d4d4d8" },
+  "Statistical Pre-filter": { bg: "bg-yellow-500/10", text: "text-yellow-400", bar: "#eab308" },
 };
 const DEFAULT_MODEL_STYLE = { bg: "bg-red-500/10", text: "text-red-500", bar: "#ef4444" };
 
@@ -93,8 +94,8 @@ const TOOLTIP_STYLE = {
 /** Stepped status messages shown during the processing phase */
 const SCAN_MESSAGES = [
   "[INITIATING PYTORCH MODELS...]",
-  "[TRAINING AUTOENCODER...]",
-  "[CALCULATING ISOLATION BOUNDARIES...]",
+  "[TRAINING PYTORCH MODELS...]",
+  "[CALIBRATING MAD THRESHOLDS...]",
   "[SCANNING ROWS...]",
   "[FINALIZING ENSEMBLE VOTES...]",
 ] as const;
@@ -106,7 +107,8 @@ export default function HomePage() {
   const [file, setFile] = useState<File | null>(null);
   const [selectedItem, setSelectedItem] = useState<FlaggedItem | null>(null);
   const [isScanning, setIsScanning] = useState(false);
-  const [scanPhase, setScanPhase] = useState<"upload" | "processing" | null>(null);
+  const [scanPhase, setScanPhase] = useState<string | null>(null);
+  const [liveStats, setLiveStats] = useState<{chunk:number; total:number; poisoned:number} | null>(null);
   const [stepIndex, setStepIndex] = useState(0);
   const [isDownloading, setIsDownloading] = useState(false);
   const [results, setResults] = useState<ScanResults | null>(null);
@@ -138,7 +140,7 @@ export default function HomePage() {
 
   /* ---- Step message cycler -------------------------------------- */
   useEffect(() => {
-    if (scanPhase !== "processing") return;
+    if (scanPhase === "UPLOADING" || !scanPhase) return;
     setStepIndex(0);
     const interval = setInterval(() => {
       setStepIndex((prev) => (prev + 1) % SCAN_MESSAGES.length);
@@ -150,7 +152,8 @@ export default function HomePage() {
   const scanDataset = async () => {
     if (!file) return;
     setIsScanning(true);
-    setScanPhase("upload");
+    setScanPhase("UPLOADING");
+    setLiveStats(null);
     setResults(null);
     setError(null);
 
@@ -158,29 +161,40 @@ export default function HomePage() {
       const formData = new FormData();
       formData.append("file", file);
 
-      const requestPromise = axios.post<ScanResults>(
-        `${API_URL}/scan-dataset`,
-        formData,
-        {
-          onUploadProgress: (progressEvent) => {
-            if (progressEvent.progress === 1) setScanPhase("processing");
-          },
+      const response = await fetch(`${API_URL}/scan-stream`, {
+        method: 'POST', body: formData
+      });
+      
+      if (!response.body) throw new Error("No readable stream available");
+      
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      
+      while(true) {
+        const {done, value} = await reader.read();
+        if(done) break;
+        const text = decoder.decode(value);
+        const lines = text.split('\n').filter(l => l.startsWith('data:'));
+        
+        for(const line of lines) {
+          try {
+            const eventString = line.slice(5).trim();
+            if (!eventString) continue;
+            
+            const event = JSON.parse(eventString);
+            if(event.event === 'phase') setScanPhase(event.data);
+            if(event.event === 'progress') {
+              setLiveStats({chunk:event.chunk, total:event.total_so_far, poisoned:event.poisoned_so_far});
+            }
+            if(event.event === 'complete') setResults(event.result);
+            if(event.event === 'error') setError(event.detail);
+          } catch(e) {
+            console.warn("Failed to parse SSE line", e);
+          }
         }
-      );
-
-      setScanPhase("processing");
-      const { data } = await requestPromise;
-      setResults(data);
-    } catch (err: unknown) {
-      if (axios.isAxiosError(err)) {
-        setError(
-          err.response?.data?.detail ??
-            err.message ??
-            "Scan failed. Is the backend running?"
-        );
-      } else {
-        setError("An unexpected error occurred.");
       }
+    } catch (err: any) {
+      setError(err.message ?? "Scan failed. Is the backend running?");
     } finally {
       setIsScanning(false);
       setScanPhase(null);
@@ -322,9 +336,9 @@ export default function HomePage() {
             className="inline-flex items-center gap-2 border border-orange-500 bg-orange-500 px-8 py-2.5 text-sm font-bold font-mono text-black uppercase tracking-widest transition-none hover:bg-orange-400 active:bg-orange-600 disabled:bg-zinc-800 disabled:border-zinc-700 disabled:text-zinc-600 disabled:pointer-events-none rounded-none"
           >
             <Activity className="h-4 w-4" />
-            {scanPhase === "upload"
+            {scanPhase === "UPLOADING"
               ? "[ UPLOADING... ]"
-              : scanPhase === "processing"
+              : scanPhase
               ? "[ PROCESSING... ]"
               : "SCAN DATASET"}
           </button>
@@ -358,7 +372,7 @@ export default function HomePage() {
             </div>
 
             {/* Phase text */}
-            {scanPhase === "upload" ? (
+            {scanPhase === "UPLOADING" ? (
               <div className="flex flex-col items-center gap-3 w-full max-w-xs">
                 <p className="font-mono text-xs text-orange-500 flex items-center gap-2 uppercase tracking-widest">
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -371,10 +385,12 @@ export default function HomePage() {
             ) : (
               <div className="flex flex-col items-center gap-4 w-full max-w-xs">
                 <p
-                  key={stepIndex}
+                  key={scanPhase || stepIndex}
                   className="font-mono text-xs text-orange-500 text-center uppercase tracking-widest animate-fade-in"
                 >
-                  {SCAN_MESSAGES[stepIndex]}
+                  {scanPhase === "TRAINING_MODELS" ? "[TRAINING PYTORCH MODELS...]" : 
+                   scanPhase === "CALIBRATING" ? "[CALIBRATING MAD THRESHOLDS...]" : 
+                   SCAN_MESSAGES[stepIndex]}
                 </p>
                 {/* step marker dots */}
                 <div className="flex gap-1 border border-zinc-800 p-1">
@@ -389,6 +405,11 @@ export default function HomePage() {
                     />
                   ))}
                 </div>
+                {liveStats && (
+                  <div className="font-mono text-xs text-zinc-400">
+                    {liveStats.total.toLocaleString()} rows scanned · {liveStats.poisoned} flagged so far
+                  </div>
+                )}
               </div>
             )}
           </div>

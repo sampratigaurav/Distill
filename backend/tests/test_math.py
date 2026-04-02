@@ -80,29 +80,12 @@ class TestEvaluateBinaryVotes:
         flags = _votes(scores, n_samples=45)
         assert len(flags) == 45
 
-    def test_sensitive_threshold_for_small_dataset(self):
-        """
-        n_samples < 200 uses threshold 3.0; n_samples >= 200 uses 3.5.
-        An outlier with a mod-z-score between 3.0 and 3.5 should be caught
-        only by the small-dataset (3.0) threshold.
-        """
-        # Place exactly 250 copies for large and 150 for small
-        base_large = np.zeros(250, dtype=np.float32)
-        base_small = np.zeros(150, dtype=np.float32)
-
-        # Scale outlier so mod-z-score ≈ 3.2 (Caught by 3.0, ignored by 3.5)
-        mad_scale = 1e-5
-        target_modz = 3.2
-        outlier_val = float(target_modz * mad_scale / 0.6745)
-
-        base_large[0] = outlier_val
-        base_small[0] = outlier_val
-
-        flags_large = _votes(base_large, n_samples=250)  # Uses threshold 3.5
-        flags_small = _votes(base_small, n_samples=150)  # Uses threshold 3.0
-
-        assert flags_large[0] == 0, "outlier should NOT be flagged with large-dataset threshold 3.5"
-        assert flags_small[0] == 1, "outlier should be flagged with the small-dataset threshold of 3.0"
+    def test_adaptive_threshold_in_bounds(self):
+        """adaptive threshold with 5% contamination hint returns value in [2.5,4.0]."""
+        rng = np.random.default_rng(0)
+        scores = rng.normal(loc=1.0, scale=0.1, size=1000).astype(np.float32)
+        median, mad, threshold = _calibrate_mad_threshold(scores, n_samples=1000, contamination=0.05)
+        assert 2.5 <= threshold <= 4.0
 
     def test_mad_epsilon_floor_prevents_zero_division(self):
         """Near-uniform data must not raise a ZeroDivisionError."""
@@ -162,7 +145,7 @@ class TestDynamicAutoencoder:
     @pytest.mark.parametrize("batch_size", [1, 4, 32])
     def test_reconstruction_error_shape(self, batch_size):
         """Reconstruction error tensor must have shape (batch_size,).
-        Eval mode is used so BatchNorm1d can handle any batch size >= 1."""
+        Eval mode is used so LayerNorm can handle any batch size >= 1."""
         input_dim = 16
         model = DynamicAutoencoder(input_dim)
         model.eval()
@@ -219,7 +202,10 @@ class TestDynamicDeepSVDD:
     @pytest.mark.parametrize("input_dim", [4, 8, 16, 64])
     def test_forward_shape(self, input_dim):
         """Forward output must map to the correct latent dimension."""
-        latent_dim = max(input_dim // 8, 1)
+        if input_dim <= 16:
+            latent_dim = max(input_dim // 2, 4)
+        else:
+            latent_dim = max(input_dim // 8, 8)
         model = DynamicDeepSVDD(input_dim)
         x = torch.randn(10, input_dim)
         out = model(x)
@@ -236,7 +222,7 @@ class TestDynamicDeepSVDD:
     @pytest.mark.parametrize("batch_size", [1, 8, 64])
     def test_anomaly_score_shape(self, batch_size):
         """Anomaly score tensor must have shape (batch_size,).
-        Eval mode is used so BatchNorm1d can handle any batch size >= 1."""
+        Eval mode is used so LayerNorm can handle any batch size >= 1."""
         input_dim = 16
         model = DynamicDeepSVDD(input_dim)
         model.eval()
@@ -248,7 +234,7 @@ class TestDynamicDeepSVDD:
     def test_center_initialized_to_zeros(self):
         """The hypersphere center buffer must start at all-zeros."""
         input_dim = 16
-        latent_dim = max(input_dim // 8, 1)
+        latent_dim = max(input_dim // 2, 4) if input_dim <= 16 else max(input_dim // 8, 8)
         model = DynamicDeepSVDD(input_dim)
         assert model.center.shape == (latent_dim,)
         assert torch.allclose(model.center, torch.zeros(latent_dim))

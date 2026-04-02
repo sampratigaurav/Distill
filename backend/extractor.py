@@ -208,7 +208,8 @@ class UniversalExtractor:
                             self.current_chunk_text_snippets[ident] = {}
                         self.current_chunk_text_snippets[ident][col] = text_data[i][:500] # store max 500 chars
 
-                    embeddings = self._text_model.encode(text_data, batch_size=128, show_progress_bar=False)
+                    encode_bs = 512 if torch.cuda.is_available() else 256
+                    embeddings = self._text_model.encode(text_data, batch_size=encode_bs, show_progress_bar=False, normalize_embeddings=True)
                     parts.append(embeddings)
                 
             if not parts:

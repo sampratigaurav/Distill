@@ -26,27 +26,32 @@ class DynamicAutoencoder(nn.Module):
         # Derive hidden sizes relative to input dimensionality.
         # Ensures the network scales gracefully from 4-feature CSVs
         # to 2048-dim image embeddings.
-        h1 = max(input_dim // 2, 4)
-        h2 = max(input_dim // 4, 2)
-        bottleneck = max(input_dim // 8, 1)
+        if input_dim <= 16:
+            h1 = max(input_dim * 2, 16)
+            h2 = max(input_dim, 8)
+            bottleneck = max(input_dim // 2, 4)
+        else:
+            h1 = max(input_dim // 2, 32)
+            h2 = max(input_dim // 4, 16)
+            bottleneck = max(input_dim // 8, 8)
 
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, h1),
-            nn.BatchNorm1d(h1),
-            nn.ReLU(inplace=True),
+            nn.LayerNorm(h1),
+            nn.GELU(),
             nn.Linear(h1, h2),
-            nn.BatchNorm1d(h2),
-            nn.ReLU(inplace=True),
+            nn.LayerNorm(h2),
+            nn.GELU(),
             nn.Linear(h2, bottleneck),
         )
 
         self.decoder = nn.Sequential(
             nn.Linear(bottleneck, h2),
-            nn.BatchNorm1d(h2),
-            nn.ReLU(inplace=True),
+            nn.LayerNorm(h2),
+            nn.GELU(),
             nn.Linear(h2, h1),
-            nn.BatchNorm1d(h1),
-            nn.ReLU(inplace=True),
+            nn.LayerNorm(h1),
+            nn.GELU(),
             nn.Linear(h1, input_dim),
         )
 
@@ -79,17 +84,22 @@ class DynamicDeepSVDD(nn.Module):
         super().__init__()
         self.input_dim = input_dim
 
-        h1 = max(input_dim // 2, 4)
-        h2 = max(input_dim // 4, 2)
-        latent_dim = max(input_dim // 8, 1)
+        if input_dim <= 16:
+            h1 = max(input_dim * 2, 16)
+            h2 = max(input_dim, 8)
+            latent_dim = max(input_dim // 2, 4)
+        else:
+            h1 = max(input_dim // 2, 32)
+            h2 = max(input_dim // 4, 16)
+            latent_dim = max(input_dim // 8, 8)
 
         self.network = nn.Sequential(
             nn.Linear(input_dim, h1),
-            nn.BatchNorm1d(h1),
-            nn.ReLU(inplace=True),
+            nn.LayerNorm(h1),
+            nn.GELU(),
             nn.Linear(h1, h2),
-            nn.BatchNorm1d(h2),
-            nn.ReLU(inplace=True),
+            nn.LayerNorm(h2),
+            nn.GELU(),
             nn.Linear(h2, latent_dim),
         )
 
