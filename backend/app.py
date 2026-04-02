@@ -427,6 +427,10 @@ def _build_flagged_items(
     reconstructions: np.ndarray,
     median_vector: np.ndarray,
     hard_flags: np.ndarray = None,
+    conf_ae: np.ndarray = None,
+    conf_svdd: np.ndarray = None,
+    conf_iso: np.ndarray = None,
+    ensemble_conf: np.ndarray = None,
 ) -> list[dict]:
     """
     Build the enriched flagged-items list.
@@ -443,7 +447,14 @@ def _build_flagged_items(
         if hard_flags[i]:
             items.append({
                 "id": ident,
+                "confidence": 1.0,
+                "severity": "CRITICAL",
                 "flagged_by": ["Statistical Pre-filter"],
+                "model_scores": {
+                    "Autoencoder": None,
+                    "Deep SVDD": None,
+                    "Isolation Forest": None
+                },
                 "explanation": {"type": "tabular", "top_contributors": []}
             })
             continue
@@ -454,13 +465,32 @@ def _build_flagged_items(
         if is_poisoned:
             flagged_by = [name for name, f in zip(model_names, flags) if f]
             explanation = _generate_xai_payload(ident, feature_vectors[i], reconstructions[ml_idx], median_vector)
+            
+            conf = float(ensemble_conf[ml_idx]) if ensemble_conf is not None else 0.0
+            if conf >= 0.80:
+                severity = "CRITICAL"
+            elif conf >= 0.65:
+                severity = "HIGH"  
+            elif conf >= 0.50:
+                severity = "MEDIUM"
+            else:
+                severity = "LOW"
+            
             items.append({
-                "id": ident, 
+                "id": ident,
+                "confidence": round(conf, 4),
+                "severity": severity,
                 "flagged_by": flagged_by,
-                "explanation": explanation
+                "model_scores": {
+                    "Autoencoder":        round(float(conf_ae[ml_idx]),   4) if conf_ae   is not None else None,
+                    "Deep SVDD":          round(float(conf_svdd[ml_idx]), 4) if conf_svdd is not None else None,
+                    "Isolation Forest":   round(float(conf_iso[ml_idx]),  4) if conf_iso  is not None else None,
+                },
+                "explanation": explanation,
             })
         ml_idx += 1
 
+    items.sort(key=lambda x: x["confidence"], reverse=True)
     return items
 
 
@@ -524,6 +554,20 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
     raw_svdd = _evaluate_deep_svdd(svdd_model, chunk0_tensor)
     raw_iso = _evaluate_isolation_forest(iso_model, first_features, pca)
     
+    def _normalize_scores_to_confidence(
+        raw_scores: np.ndarray,
+        median: float,
+        mad: float,
+    ) -> np.ndarray:
+        """
+        Convert raw anomaly scores to [0,1] confidence using sigmoid
+        on modified Z-scores. 0=definitely clean, 1=definitely poisoned.
+        """
+        mod_z = 0.6745 * (raw_scores - median) / max(mad, 1e-5)
+        # Sigmoid centered at threshold=0, scale=0.5 gives smooth curve
+        confidence = 1.0 / (1.0 + np.exp(-0.5 * mod_z))
+        return confidence.astype(np.float32)
+
     # Freeze thresholds using Chunk 0 topography
     chunk0_len = len(first_features)
     contam = max(0.001, min(0.05, 10.0 / chunk0_len)) if chunk0_len > 0 else 0.05
@@ -588,6 +632,14 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
             svdd_flags = _evaluate_binary_votes(c_raw_svdd, svdd_median, svdd_mad, svdd_thresh)
             iso_flags = _evaluate_binary_votes(c_raw_iso, iso_median, iso_mad, iso_thresh)
             
+            conf_ae   = _normalize_scores_to_confidence(c_raw_ae,   ae_median,   ae_mad)
+            conf_svdd = _normalize_scores_to_confidence(c_raw_svdd, svdd_median, svdd_mad)
+            conf_iso  = _normalize_scores_to_confidence(c_raw_iso,  iso_median,  iso_mad)
+            
+            # Weighted ensemble confidence (AE+SVDD weighted higher, ISO lower)
+            # because AE and SVDD are trained specifically on this data
+            ensemble_conf = (0.4*conf_ae + 0.4*conf_svdd + 0.2*conf_iso)
+            
             model_breakdown[MODEL_AE] += int(ae_flags.sum())
             model_breakdown[MODEL_SVDD] += int(svdd_flags.sum())
             model_breakdown[MODEL_ISO] += int(iso_flags.sum())
@@ -596,12 +648,17 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
             ae_flags = np.array([])
             svdd_flags = np.array([])
             iso_flags = np.array([])
+            conf_ae = np.array([])
+            conf_svdd = np.array([])
+            conf_iso = np.array([])
+            ensemble_conf = np.array([])
             
         model_breakdown["Statistical Pre-filter"] += int(hard_flags.sum())
         
         # Generate XAI Explanations strictly for flagged samples
         chunk_flags = _build_flagged_items(
-            identifiers, ae_flags, svdd_flags, iso_flags, features, c_recons, median_vector, hard_flags
+            identifiers, ae_flags, svdd_flags, iso_flags, features, c_recons, median_vector, hard_flags,
+            conf_ae, conf_svdd, conf_iso, ensemble_conf
         )
         flagged_items.extend(chunk_flags)
         
@@ -612,11 +669,19 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
     poisoned_count = len(flagged_items)
     anomaly_pct = round((poisoned_count / total_samples) * 100, 2) if total_samples > 0 else 0.0
 
+    confidence_distribution = {
+        "CRITICAL": sum(1 for item in flagged_items if item["severity"] == "CRITICAL"),
+        "HIGH":     sum(1 for item in flagged_items if item["severity"] == "HIGH"),
+        "MEDIUM":   sum(1 for item in flagged_items if item["severity"] == "MEDIUM"),
+        "LOW":      sum(1 for item in flagged_items if item["severity"] == "LOW"),
+    }
+
     return {
         "total_samples": total_samples,
         "poisoned_samples": poisoned_count,
         "anomaly_percentage": anomaly_pct,
         "model_breakdown": model_breakdown,
+        "confidence_distribution": confidence_distribution,
         "flagged_items": flagged_items,
     }
 

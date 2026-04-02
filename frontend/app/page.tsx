@@ -51,7 +51,10 @@ type Explanation =
 
 interface FlaggedItem {
   id: string;
+  confidence: number;
+  severity: "CRITICAL" | "HIGH" | "MEDIUM" | "LOW";
   flagged_by: string[];
+  model_scores: Record<string, number | null>;
   explanation?: Explanation;
 }
 
@@ -60,6 +63,7 @@ interface ScanResults {
   poisoned_samples: number;
   anomaly_percentage: number;
   model_breakdown: Record<string, number>;
+  confidence_distribution: Record<string, number>;
   flagged_items: FlaggedItem[];
 }
 
