@@ -426,12 +426,15 @@ def _build_flagged_items(
     feature_vectors: np.ndarray,
     reconstructions: np.ndarray,
     median_vector: np.ndarray,
-    hard_flags: np.ndarray,
+    hard_flags: np.ndarray = None,
 ) -> list[dict]:
     """
     Build the enriched flagged-items list.
     A sample is poisoned IF AND ONLY IF total_votes >= 2.
     """
+    if hard_flags is None:
+        hard_flags = np.zeros(len(identifiers), dtype=bool)
+
     model_names = [MODEL_AE, MODEL_SVDD, MODEL_ISO]
     items: list[dict] = []
 
