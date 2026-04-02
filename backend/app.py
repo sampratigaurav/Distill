@@ -652,11 +652,11 @@ async def scan_stream(request: Request, file: UploadFile = File(...)):
     """
     async def generate():
         try:
-            yield f"data: {json.dumps({'event':'phase','data':'UPLOADING'})}\\n\\n"
+            yield f"data: {json.dumps({'event':'phase','data':'UPLOADING'})}\n\n"
             
             data_stream, temp_path = await extractor.process_upload(file)
             
-            yield f"data: {json.dumps({'event':'phase','data':'TRAINING_MODELS'})}\\n\\n"
+            yield f"data: {json.dumps({'event':'phase','data':'TRAINING_MODELS'})}\n\n"
             
             queue = asyncio.Queue()
             ev_loop = asyncio.get_event_loop()
@@ -687,12 +687,12 @@ async def scan_stream(request: Request, file: UploadFile = File(...)):
             
             while True:
                 event = await queue.get()
-                yield f"data: {json.dumps(event)}\\n\\n"
+                yield f"data: {json.dumps(event)}\n\n"
                 await asyncio.sleep(0)  # flush buffer implicitly via loop
                 if event["event"] in ("complete", "error"):
                     break
         except Exception as e:
-            yield f"data: {json.dumps({'event':'error','detail':str(e)})}\\n\\n"
+            yield f"data: {json.dumps({'event':'error','detail':str(e)})}\n\n"
         finally:
             if 'temp_path' in locals():
                 remove_file(temp_path)

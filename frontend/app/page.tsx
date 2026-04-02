@@ -170,26 +170,56 @@ export default function HomePage() {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       
-      while(true) {
-        const {done, value} = await reader.read();
-        if(done) break;
-        const text = decoder.decode(value);
-        const lines = text.split('\n').filter(l => l.startsWith('data:'));
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
         
-        for(const line of lines) {
+        buffer += decoder.decode(value, { stream: true })
+        
+        // SSE frames are separated by double newline
+        const frames = buffer.split('\n\n')
+        buffer = frames.pop() ?? ''  // last may be incomplete, keep it
+        
+        for (const frame of frames) {
+          // A frame can have multiple lines (event:, data:, id:, etc)
+          // We only care about lines starting with "data:"
+          const dataLine = frame
+            .split('\n')
+            .find(line => line.startsWith('data:'))
+          
+          if (!dataLine) continue
+          
+          // Strip "data:" prefix and trim whitespace
+          const jsonStr = dataLine.slice(5).trim()
+          
+          if (!jsonStr || jsonStr === '[DONE]') continue
+          
           try {
-            const eventString = line.slice(5).trim();
-            if (!eventString) continue;
+            const event = JSON.parse(jsonStr)
             
-            const event = JSON.parse(eventString);
-            if(event.event === 'phase') setScanPhase(event.data);
-            if(event.event === 'progress') {
-              setLiveStats({chunk:event.chunk, total:event.total_so_far, poisoned:event.poisoned_so_far});
+            if (event.event === 'phase') {
+              setScanPhase(event.data)
+            } else if (event.event === 'progress') {
+              setLiveStats({
+                chunk: event.chunk,
+                total: event.total_so_far,
+                poisoned: event.poisoned_so_far,
+              })
+            } else if (event.event === 'complete') {
+              setResults(event.result)
+              setIsScanning(false)
+              setScanPhase(null)
+            } else if (event.event === 'error') {
+              setError(event.detail)
+              setIsScanning(false)
+              setScanPhase(null)
             }
-            if(event.event === 'complete') setResults(event.result);
-            if(event.event === 'error') setError(event.detail);
-          } catch(e) {
-            console.warn("Failed to parse SSE line", e);
+          } catch (e) {
+            // Skip unparseable frames silently
+            console.warn('SSE parse skip:', dataLine)
+            continue
           }
         }
       }
