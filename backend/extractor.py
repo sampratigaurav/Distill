@@ -55,6 +55,9 @@ class UniversalExtractor:
     """
 
     def __init__(self) -> None:
+        self.device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
         # Lazy-loaded on first image ZIP upload
         self._resnet: nn.Module | None = None
         self._transform: T.Compose | None = None
