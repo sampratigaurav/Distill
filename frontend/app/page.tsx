@@ -65,6 +65,7 @@ interface ScanResults {
   model_breakdown: Record<string, number>;
   confidence_distribution: Record<string, number>;
   flagged_items: FlaggedItem[];
+  warning?: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -399,6 +400,16 @@ export default function HomePage() {
           >
             <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
             <span>{error}</span>
+          </div>
+        )}
+
+        {/* ── Warning ─────────────────────────────────────────────── */}
+        {results?.warning && (
+          <div className="border border-yellow-500 bg-yellow-500/10
+            px-4 py-3 text-xs font-mono text-yellow-400
+            flex items-start gap-3 rounded-none">
+            <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+            <span>{results.warning}</span>
           </div>
         )}
 

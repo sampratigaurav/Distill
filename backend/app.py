@@ -48,8 +48,8 @@ from models import DynamicAutoencoder, DynamicDeepSVDD
    => CONFIRMED: `input_dim <= 16` sets `bottleneck = max(input_dim // 2, 4)`. For dimension 4, out_features is precisely 4.
 3. DynamicDeepSVDD center is set AFTER main training loop
    => NEGATIVE / SET BEFORE: As instructed in the new 3-pass flow, the center is fundamentally established AFTER the 2-epoch Warm-Up phase, but BEFORE the main training (EPOCHS) loop to actively penalize divergence against the static target.
-4. IsolationForest contamination != 'auto'
-   => CONFIRMED: Parameter explicitly calculates mathematical topology via `float(np.clip(10.0 / n, 0.001, 0.05))`.
+4. IsolationForest contamination == 'auto'
+   => CONFIRMED: Uses scikit-learn's built-in heuristic (`contamination='auto'`).
 5. F.normalize only runs when extractor.last_images is truthy
    => CONFIRMED: Normalization block condition requires mutually inclusive `if extractor.last_images and input_dim >= 512:` boundaries, preventing NLP overwrites.
 ===================================================
@@ -152,15 +152,28 @@ MODEL_ISO = "Isolation Forest"
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _calibrate_mad_threshold(raw_scores: np.ndarray, n_samples: int, contamination: float = 0.05) -> Tuple[float, float, float]:
+def _find_natural_threshold(raw_scores: np.ndarray,
+                             median: float, mad: float) -> float:
+    sorted_scores = np.sort(raw_scores)
+    if len(sorted_scores) < 10:
+        return 3.0
+    gaps = np.diff(sorted_scores)
+    upper_start = int(len(gaps) * 0.70)
+    upper_gaps = gaps[upper_start:]
+    if len(upper_gaps) > 0 and upper_gaps.mean() > 0:
+        if upper_gaps.max() > 3 * upper_gaps.mean():
+            cliff_idx = upper_start + np.argmax(upper_gaps)
+            natural_threshold = sorted_scores[cliff_idx]
+            z = 0.6745 * (natural_threshold - median) / max(mad, 1e-5)
+            return float(np.clip(z, 2.0, 6.0))
+    return 3.5
+
+def _calibrate_mad_threshold(raw_scores: np.ndarray, n_samples: int) -> Tuple[float, float, float]:
     """Calculate and freeze MAD scaling logic on the first training chunk."""
     median = float(np.median(raw_scores))
     mad = float(np.median(np.abs(raw_scores - median)))
     mad = max(mad, 1e-5) # Prevent zero-division
-    
-    upper_bound = np.percentile(raw_scores, (1 - contamination) * 100)
-    z_thresh = 0.6745 * (upper_bound - median) / mad
-    threshold = float(np.clip(z_thresh, 2.5, 4.0))
+    threshold = _find_natural_threshold(raw_scores, median, mad)
     return median, mad, threshold
 
 def _evaluate_binary_votes(raw_scores: np.ndarray, median: float, mad: float, threshold: float) -> np.ndarray:
@@ -351,13 +364,11 @@ def _fit_pca(train_features: np.ndarray) -> PCA | None:
     return pca
 
 def _train_isolation_forest(train_features: np.ndarray, pca=None) -> IsolationForest:
-    n = len(train_features)
-    contamination = float(np.clip(10.0 / n, 0.001, 0.05))
     fit_features = pca.transform(train_features) if pca else train_features
     iso = IsolationForest(
-        n_estimators=200, 
-        contamination=contamination, 
-        n_jobs=-1, 
+        n_estimators=200,
+        contamination='auto',
+        n_jobs=-1,
         random_state=42
     )
     iso.fit(fit_features)
@@ -431,10 +442,11 @@ def _build_flagged_items(
     conf_svdd: np.ndarray = None,
     conf_iso: np.ndarray = None,
     ensemble_conf: np.ndarray = None,
+    n_samples: int = 0,
 ) -> list[dict]:
     """
     Build the enriched flagged-items list.
-    A sample is poisoned IF AND ONLY IF total_votes >= 2.
+    Requires >= 2 votes normally; >= 1 vote for small chunks (< 100 samples).
     """
     if hard_flags is None:
         hard_flags = np.zeros(len(identifiers), dtype=bool)
@@ -461,7 +473,8 @@ def _build_flagged_items(
 
         flags = [ae_flags[ml_idx], svdd_flags[ml_idx], iso_flags[ml_idx]]
         total_votes = sum(flags)
-        is_poisoned = bool(total_votes >= 2)
+        min_votes = 1 if n_samples < 100 else 2
+        is_poisoned = bool(total_votes >= min_votes)
         if is_poisoned:
             flagged_by = [name for name, f in zip(model_names, flags) if f]
             explanation = _generate_xai_payload(ident, feature_vectors[i], reconstructions[ml_idx], median_vector)
@@ -535,6 +548,14 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
     # 2. Extract Chunk 0 (The Base Pattern)
     first_features, first_identifiers = next(data_stream)
     input_dim = first_features.shape[1]
+
+    warning = None
+    if len(first_features) < 100:
+        warning = (
+            f"Only {len(first_features)} samples detected. "
+            "Reliable detection needs 100+ samples. "
+            "Results may be inaccurate."
+        )
     
     # 3. Prepare PyTorch tensors for Chunk 0
     chunk0_tensor = torch.tensor(first_features, dtype=torch.float32)
@@ -571,10 +592,9 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
     
     # Freeze thresholds using Chunk 0 topography
     chunk0_len = len(first_features)
-    contam = max(0.001, min(0.05, 10.0 / chunk0_len)) if chunk0_len > 0 else 0.05
-    ae_median, ae_mad, ae_thresh = _calibrate_mad_threshold(raw_ae, chunk0_len, contamination=contam)
-    svdd_median, svdd_mad, svdd_thresh = _calibrate_mad_threshold(raw_svdd, chunk0_len, contamination=contam)
-    iso_median, iso_mad, iso_thresh = _calibrate_mad_threshold(raw_iso, chunk0_len, contamination=contam)
+    ae_median, ae_mad, ae_thresh = _calibrate_mad_threshold(raw_ae, chunk0_len)
+    svdd_median, svdd_mad, svdd_thresh = _calibrate_mad_threshold(raw_svdd, chunk0_len)
+    iso_median, iso_mad, iso_thresh = _calibrate_mad_threshold(raw_iso, chunk0_len)
     
     median_vector = np.median(first_features, axis=0)
 
@@ -659,7 +679,7 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
         # Generate XAI Explanations strictly for flagged samples
         chunk_flags = _build_flagged_items(
             identifiers, ae_flags, svdd_flags, iso_flags, features, c_recons, median_vector, hard_flags,
-            conf_ae, conf_svdd, conf_iso, ensemble_conf
+            conf_ae, conf_svdd, conf_iso, ensemble_conf, n_samples=len(identifiers)
         )
         flagged_items.extend(chunk_flags)
         
@@ -684,6 +704,7 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
         "model_breakdown": model_breakdown,
         "confidence_distribution": confidence_distribution,
         "flagged_items": flagged_items,
+        "warning": warning,
     }
 
 

@@ -81,11 +81,11 @@ class TestEvaluateBinaryVotes:
         assert len(flags) == 45
 
     def test_adaptive_threshold_in_bounds(self):
-        """adaptive threshold with 5% contamination hint returns value in [2.5,4.0]."""
+        """Adaptive threshold returns a value in [2.0, 6.0]."""
         rng = np.random.default_rng(0)
         scores = rng.normal(loc=1.0, scale=0.1, size=1000).astype(np.float32)
-        median, mad, threshold = _calibrate_mad_threshold(scores, n_samples=1000, contamination=0.05)
-        assert 2.5 <= threshold <= 4.0
+        median, mad, threshold = _calibrate_mad_threshold(scores, n_samples=1000)
+        assert 2.0 <= threshold <= 6.0
 
     def test_mad_epsilon_floor_prevents_zero_division(self):
         """Near-uniform data must not raise a ZeroDivisionError."""
@@ -94,31 +94,6 @@ class TestEvaluateBinaryVotes:
         # Should complete without exception
         flags = _votes(scores, n_samples=25)
         assert isinstance(flags, np.ndarray)
-
-
-# ---------------------------------------------------------------------------
-# Isolation-Forest dynamic contamination formula
-# ---------------------------------------------------------------------------
-
-class TestIsolationForestContamination:
-    """Tests for the `max(0.001, min(0.05, 10.0 / n))` formula in app.py.
-
-    The contamination parameter tells Isolation Forest the expected fraction
-    of outliers in the training data. A higher value means more samples will
-    be labelled anomalous. The formula scales dynamically with dataset size
-    while staying within the [0.001, 0.05] safe range.
-    """
-
-    @pytest.mark.parametrize("n, expected", [
-        (10,    0.05),    # 10/10 = 1.0 → capped at 0.05
-        (200,   0.05),    # 10/200 = 0.05 → exactly at cap
-        (1_000, 0.01),    # 10/1000 = 0.01
-        (10_000, 0.001),  # 10/10000 = 0.001 → exactly at floor
-        (100_000, 0.001), # below floor → floored at 0.001
-    ])
-    def test_contamination_bounds(self, n, expected):
-        contam = max(0.001, min(0.05, 10.0 / n))
-        assert abs(contam - expected) < 1e-9
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +259,7 @@ class TestEnsembleVoting:
         fv = np.zeros((1, 4), dtype=np.float32)
         rc = np.zeros((1, 4), dtype=np.float32)
         mv = np.zeros(4, dtype=np.float32)
-        items = _build_flagged_items(identifiers, ae_f, sv_f, is_f, fv, rc, mv)
+        items = _build_flagged_items(identifiers, ae_f, sv_f, is_f, fv, rc, mv, n_samples=200)
         assert items == []
 
     def test_one_vote_not_flagged(self):
@@ -294,7 +269,7 @@ class TestEnsembleVoting:
             fv = np.zeros((1, 4), dtype=np.float32)
             rc = np.zeros((1, 4), dtype=np.float32)
             mv = np.zeros(4, dtype=np.float32)
-            items = _build_flagged_items(identifiers, ae_f, sv_f, is_f, fv, rc, mv)
+            items = _build_flagged_items(identifiers, ae_f, sv_f, is_f, fv, rc, mv, n_samples=200)
             assert items == [], f"single vote from {combo} should not flag the sample"
 
     def test_two_votes_flagged(self):
@@ -304,7 +279,7 @@ class TestEnsembleVoting:
             fv = np.zeros((1, 4), dtype=np.float32)
             rc = np.zeros((1, 4), dtype=np.float32)
             mv = np.zeros(4, dtype=np.float32)
-            items = _build_flagged_items(identifiers, ae_f, sv_f, is_f, fv, rc, mv)
+            items = _build_flagged_items(identifiers, ae_f, sv_f, is_f, fv, rc, mv, n_samples=200)
             assert len(items) == 1, f"two votes from {combo} should flag the sample"
             assert items[0]["id"] == "a"
 
@@ -314,7 +289,7 @@ class TestEnsembleVoting:
         fv = np.zeros((1, 4), dtype=np.float32)
         rc = np.zeros((1, 4), dtype=np.float32)
         mv = np.zeros(4, dtype=np.float32)
-        items = _build_flagged_items(identifiers, ae_f, sv_f, is_f, fv, rc, mv)
+        items = _build_flagged_items(identifiers, ae_f, sv_f, is_f, fv, rc, mv, n_samples=200)
         assert len(items) == 1
 
     def test_flagged_by_attribution(self):
@@ -326,7 +301,7 @@ class TestEnsembleVoting:
         fv = np.zeros((1, 4), dtype=np.float32)
         rc = np.zeros((1, 4), dtype=np.float32)
         mv = np.zeros(4, dtype=np.float32)
-        items = _build_flagged_items(identifiers, ae_f, sv_f, is_f, fv, rc, mv)
+        items = _build_flagged_items(identifiers, ae_f, sv_f, is_f, fv, rc, mv, n_samples=200)
         assert len(items) == 1
         assert set(items[0]["flagged_by"]) == {"Autoencoder", "Isolation Forest"}
 
@@ -339,7 +314,7 @@ class TestEnsembleVoting:
         fv = np.zeros((3, 4), dtype=np.float32)
         rc = np.zeros((3, 4), dtype=np.float32)
         mv = np.zeros(4, dtype=np.float32)
-        items = _build_flagged_items(identifiers, ae_f, sv_f, is_f, fv, rc, mv)
+        items = _build_flagged_items(identifiers, ae_f, sv_f, is_f, fv, rc, mv, n_samples=200)
         flagged_ids = {item["id"] for item in items}
         assert flagged_ids == {"poisoned"}
 
