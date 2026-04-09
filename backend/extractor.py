@@ -379,11 +379,6 @@ class UniversalExtractor:
                 feats = self._clip_model.encode_image(batch_tensor)
                 feats_np = feats.cpu().float().numpy()
 
-            import logging
-            logging.warning(f"CLIP model loaded: {self._clip_model is not None}")
-            logging.warning(f"ResNet model loaded: {self._resnet is not None}")
-            logging.warning(f"Feature shape: {feats_np.shape}")
-
             # Zero-shot scoring: one float per image, store in dict
             if text_features_np is not None:
                 norms = np.linalg.norm(feats_np, axis=1, keepdims=True)

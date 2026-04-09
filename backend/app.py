@@ -235,20 +235,20 @@ def _statistical_prefilter(
 
 def _cosine_similarity_scores(features: np.ndarray) -> np.ndarray:
     """
-    Score each sample by its average pairwise cosine similarity to 
-    all other samples. Low average similarity = more anomalous.
-    Returns anomaly scores (high = anomalous) shaped (n_samples,).
-    Uses sklearn's cosine_similarity for efficiency.
+    Score each sample by cosine similarity to the chunk centroid.
+    Low similarity to centroid = more anomalous.
+    O(n*d) compute, O(n) memory — scales to any dataset size.
     """
-    from sklearn.metrics.pairwise import cosine_similarity
     n = len(features)
     if n < 2:
         return np.zeros(n, dtype=np.float32)
-    sim_matrix = cosine_similarity(features)  # (n, n)
-    # Average similarity to all OTHER samples (exclude self-similarity)
-    avg_sim = (sim_matrix.sum(axis=1) - 1.0) / max(n - 1, 1)
-    # Invert: low similarity = high anomaly score
-    anomaly_scores = 1.0 - avg_sim
+    centroid = features.mean(axis=0, keepdims=True)
+    centroid_norm = centroid / (
+        np.linalg.norm(centroid) + 1e-8)
+    feature_norms = np.linalg.norm(features, axis=1, keepdims=True)
+    features_norm = features / (feature_norms + 1e-8)
+    similarities = (features_norm @ centroid_norm.T).squeeze(-1)
+    anomaly_scores = 1.0 - similarities
     return anomaly_scores.astype(np.float32)
 
 
@@ -796,11 +796,6 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
                         _calibrate_mad_threshold(clip_anomaly, len(clip_anomaly))
                     clip_flags = _evaluate_binary_votes(
                         clip_anomaly, clip_median, clip_mad, clip_thresh)
-                    
-                    import logging
-                    logging.warning(f"Fix B clip_thresh: {clip_thresh:.4f}")
-                    logging.warning(f"Fix B clip_flags: {clip_flags}")
-                    logging.warning(f"Fix B clip_anomaly: {clip_anomaly}")
                     
                     # Force all three model votes for anything CLIP flags.
                     # CLIP zero-shot is high-signal when prompt is provided —
