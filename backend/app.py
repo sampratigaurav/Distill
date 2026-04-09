@@ -874,6 +874,13 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
         "LOW":      sum(1 for item in flagged_items if item["severity"] == "LOW"),
     }
 
+    import logging
+    logging.warning(
+        f"[Distill] Scan complete — total_samples: {total_samples}, "
+        f"poisoned: {poisoned_count}, "
+        f"elapsed: {round(time.time() - start_time, 1)}s"
+    )
+
     return {
         "total_samples": total_samples,
         "poisoned_samples": poisoned_count,
