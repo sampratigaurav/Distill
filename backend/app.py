@@ -767,7 +767,9 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
             # because AE and SVDD are trained specifically on this data
             ensemble_conf = (0.4*conf_ae + 0.4*conf_svdd + 0.2*conf_iso)
 
-            # Fix B: CLIP zero-shot direct voting
+            # Fix B: CLIP zero-shot as a fourth model score, run through
+            # the same universal MAD thresholding as AE/SVDD/ISO.
+            # No hardcoded thresholds — the data tells us where to cut.
             if (hasattr(extractor, 'last_clip_similarities') and
                     extractor.last_clip_similarities is not None and
                     isinstance(extractor.last_clip_similarities, dict)):
@@ -782,51 +784,32 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
                 ], dtype=np.float32)
                 
                 if len(clip_sims) == len(ml_features):
-                    clip_min, clip_max = clip_sims.min(), clip_sims.max()
-                    clip_norm = (clip_sims - clip_min) / (
-                        clip_max - clip_min + 1e-8)
-                    clip_anomaly = 1.0 - clip_norm
-
-                    import logging
-                    logging.warning(f"Fix B firing — clip_sims shape: {clip_sims.shape}")
-                    logging.warning(f"Fix B clip_sims values: {clip_sims}")
-                    logging.warning(f"Fix B clip_anomaly values: {clip_anomaly}")
-                    logging.warning(f"Fix B identifiers: {ml_identifiers}")
-
-                    # Samples with clip_anomaly > 0.5 get forced votes
-                    # from all three models — overrides MAD thresholding
-                    # Adaptive threshold: find natural gap in clip_anomaly distribution
-                    # Same philosophy as _find_natural_threshold for MAD scoring.
-                    # Sort anomaly scores, look for the largest gap in the upper 30%,
-                    # use that as the split point. Falls back to median + 1.5*IQR 
-                    # if no clear gap exists.
-                    def _clip_adaptive_threshold(scores: np.ndarray) -> float:
-                        if len(scores) < 4:
-                            return 0.6  # not enough data, safe fallback
-                        sorted_s = np.sort(scores)
-                        gaps = np.diff(sorted_s)
-                        upper_start = int(len(gaps) * 0.60)
-                        upper_gaps = gaps[upper_start:]
-                        if len(upper_gaps) > 0 and upper_gaps.mean() > 0:
-                            if upper_gaps.max() > 2.5 * upper_gaps.mean():
-                                cliff_idx = upper_start + np.argmax(upper_gaps)
-                                return float(sorted_s[cliff_idx])
-                        # Fallback: median + 1.5 * IQR
-                        q1, q3 = np.percentile(scores, [25, 75])
-                        iqr = q3 - q1
-                        return float(min(np.median(scores) + 1.5 * iqr, 0.85))
-
-                    clip_threshold = _clip_adaptive_threshold(clip_anomaly)
-                    clip_votes = (clip_anomaly > clip_threshold).astype(np.int32)
+                    # Invert: low similarity to prompt = high anomaly score
+                    clip_anomaly = 1.0 - (
+                        (clip_sims - clip_sims.min()) / 
+                        (clip_sims.max() - clip_sims.min() + 1e-8)
+                    )
+                    
+                    # Run clip_anomaly through MAD — same path as AE/SVDD/ISO.
+                    # Calibrate on this chunk's own distribution.
+                    clip_median, clip_mad, clip_thresh = \
+                        _calibrate_mad_threshold(clip_anomaly, len(clip_anomaly))
+                    clip_flags = _evaluate_binary_votes(
+                        clip_anomaly, clip_median, clip_mad, clip_thresh)
                     
                     import logging
-                    logging.warning(f"Fix B adaptive threshold: {clip_threshold:.4f}")
-                    logging.warning(f"Fix B votes: {clip_votes}")
-                    ae_flags   = np.maximum(ae_flags,   clip_votes)
-                    svdd_flags = np.maximum(svdd_flags, clip_votes)
-                    iso_flags  = np.maximum(iso_flags,  clip_votes)
-
-                    # Also boost confidence scores for clip-flagged samples
+                    logging.warning(f"Fix B clip_thresh: {clip_thresh:.4f}")
+                    logging.warning(f"Fix B clip_flags: {clip_flags}")
+                    logging.warning(f"Fix B clip_anomaly: {clip_anomaly}")
+                    
+                    # Force all three model votes for anything CLIP flags.
+                    # CLIP zero-shot is high-signal when prompt is provided —
+                    # if CLIP says anomaly, trust it.
+                    ae_flags   = np.maximum(ae_flags,   clip_flags)
+                    svdd_flags = np.maximum(svdd_flags, clip_flags)
+                    iso_flags  = np.maximum(iso_flags,  clip_flags)
+                    
+                    # Boost confidence proportional to clip anomaly score
                     clip_conf = clip_anomaly.clip(0, 1)
                     conf_ae   = np.maximum(conf_ae,   clip_conf)
                     conf_svdd = np.maximum(conf_svdd, clip_conf)
