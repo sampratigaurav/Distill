@@ -206,29 +206,37 @@ def _statistical_prefilter(
     columns: list[str],
 ) -> np.ndarray:
     """
-    Returns boolean mask (True=hard anomaly) using:
-    1. Per-column modified Z-score > 6.0 (6-sigma rule)
-    2. IQR fence: value < Q1 - 4*IQR or > Q3 + 4*IQR
-    3. Any row triggering EITHER rule on ANY column → hard anomaly
+    Hard pre-filter for CORRUPTED data only — not anomalies.
+    
+    Flags rows that are almost certainly data corruption:
+    - Infinite values
+    - NaN values that survived preprocessing
+    - Values beyond 10-sigma (physically impossible in any real dataset)
+    
+    Does NOT flag statistical outliers — that is the ML ensemble's job.
+    This filter exists only to prevent corrupted data from poisoning 
+    model training, not to detect anomalies.
     """
     n, d = features.shape
     hard_flags = np.zeros(n, dtype=bool)
-
+    
+    # Infinite or NaN values — always corruption
+    hard_flags |= ~np.isfinite(features).all(axis=1)
+    
+    # 10-sigma rule — physically impossible values only
+    # This threshold is intentionally very loose to avoid 
+    # false positives on any legitimate dataset distribution
     for col_idx in range(d):
         col = features[:, col_idx]
-        
-        # Modified Z-score
-        median = np.median(col)
-        mad = np.median(np.abs(col - median))
-        mad = max(mad, 1e-5)
-        mod_z = 0.6745 * np.abs(col - median) / mad
-        hard_flags |= (mod_z > 6.0)
-        
-        # IQR fence (4x = extreme outlier, not just mild)
-        q1, q3 = np.percentile(col, [25, 75])
-        iqr = q3 - q1
-        if iqr > 1e-5:
-            hard_flags |= (col < q1 - 4*iqr) | (col > q3 + 4*iqr)
+        finite_col = col[np.isfinite(col)]
+        if len(finite_col) < 2:
+            continue
+        mean = np.mean(finite_col)
+        std = np.std(finite_col)
+        if std < 1e-10:
+            continue
+        z = np.abs(col - mean) / std
+        hard_flags |= (z > 10.0)
     
     return hard_flags
 
