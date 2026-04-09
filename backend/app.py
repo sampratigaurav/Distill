@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from fastapi import FastAPI, File, Form, UploadFile, Request, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, Form, UploadFile, Request, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from sklearn.decomposition import PCA
@@ -97,6 +97,25 @@ class LimitUploadSizeMiddleware:
             return message
 
         await self.app(scope, receive_with_limit, send)
+
+import secrets
+from fastapi import Header
+
+API_KEY = os.getenv("DISTILL_API_KEY", None)
+
+async def verify_api_key(
+    x_api_key: str | None = Header(None)
+) -> bool:
+    if API_KEY is None:
+        return True  # no key configured = open access
+    if x_api_key is None or not secrets.compare_digest(
+        x_api_key, API_KEY
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing X-API-Key header."
+        )
+    return True
 
 app = FastAPI(
     title="Universal Data Sanitization API",
@@ -516,6 +535,50 @@ async def health():
     return {"status": "healthy", "version": app.version}
 
 
+@app.get("/api-info")
+async def api_info():
+    return {
+        "name": "Distill API",
+        "version": app.version,
+        "description": (
+            "Universal data sanitization and poisoning "
+            "detection API"
+        ),
+        "authentication": (
+            "Pass X-API-Key header if configured"
+        ),
+        "endpoints": {
+            "POST /scan-dataset": (
+                "Upload CSV/ZIP/Parquet, returns full "
+                "scan results as JSON"
+            ),
+            "POST /scan-stream": (
+                "Same as scan-dataset but streams "
+                "progress via SSE"
+            ),
+            "POST /download-sanitized": (
+                "Upload original file + scan results, "
+                "returns cleaned ZIP"
+            ),
+            "GET /pickup-sanitized/{file_id}": (
+                "Download the cleaned file"
+            ),
+        },
+        "supported_formats": [
+            "CSV (.csv)",
+            "ZIP archive of images (.zip)",
+            "ZIP archive of CSVs (.zip)",
+            "Parquet (.parquet)",
+        ],
+        "models": [
+            "CLIP ViT-B/32 (image feature extraction)",
+            "SentenceTransformer all-MiniLM-L6-v2 (NLP)",
+            "DynamicAutoencoder (PyTorch)",
+            "DynamicDeepSVDD (PyTorch)",
+            "IsolationForest (scikit-learn)",
+        ],
+    }
+
 # Temp uploads directory used in the Modal container
 _TEMP_UPLOADS_DIR = os.getenv('TEMP_UPLOADS_DIR', os.path.join(os.getcwd(), 'temp_uploads'))
 os.makedirs(_TEMP_UPLOADS_DIR, exist_ok=True)
@@ -710,7 +773,11 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
 
 @app.post("/scan-dataset")
 @limiter.limit("5/minute")
-async def scan_dataset(request: Request, file: UploadFile = File(...)):
+async def scan_dataset(
+    request: Request,
+    file: UploadFile = File(...),
+    _: bool = Depends(verify_api_key),
+):
     """
     Upload a CSV or ZIP, run an ensemble of three anomaly detectors,
     and return the flagged (poisoned) samples with per-model attribution.
@@ -741,7 +808,11 @@ async def scan_dataset(request: Request, file: UploadFile = File(...)):
 
 @app.post("/scan-stream")
 @limiter.limit("5/minute")  
-async def scan_stream(request: Request, file: UploadFile = File(...)):
+async def scan_stream(
+    request: Request,
+    file: UploadFile = File(...),
+    _: bool = Depends(verify_api_key),
+):
     """
     SSE endpoint. Yields progress events then final result.
     """
@@ -1016,9 +1087,11 @@ distill_image = (
         "slowapi",
         "fpdf2",
         "sentence-transformers",
+        "open-clip-torch",
+        "pyarrow",
     )
-    # Cache the 44MB ResNet-18 weights during image build to prevent cold-start latency
-    .run_commands('python -c "from torchvision.models import resnet18, ResNet18_Weights; resnet18(weights=ResNet18_Weights.DEFAULT)"')
+    # Cache CLIP ViT-B-32 weights during image build to prevent cold-start latency
+    .run_commands('python -c "import open_clip; open_clip.create_model_and_transforms(\'ViT-B-32\', pretrained=\'openai\')"')
     # Cache the all-MiniLM-L6-v2 model for text embedding
     .run_commands('python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer(\'all-MiniLM-L6-v2\')"')
     # NEW MODAL 1.0 SYNTAX: Add local files directly to the image builder
@@ -1035,6 +1108,7 @@ distill_image = (
     image=distill_image,
     gpu="T4",
     memory=8192,
+    keep_warm=1,
 )
 @modal.asgi_app()
 def serve():

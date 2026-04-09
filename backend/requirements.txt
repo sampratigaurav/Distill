@@ -11,3 +11,5 @@ pillow
 slowapi
 fpdf2
 sentence-transformers
+open-clip-torch
+pyarrow

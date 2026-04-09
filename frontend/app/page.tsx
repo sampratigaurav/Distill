@@ -105,11 +105,11 @@ const TOOLTIP_STYLE = {
 
 /** Stepped status messages shown during the processing phase */
 const SCAN_MESSAGES = [
-  "[INITIATING PYTORCH MODELS...]",
-  "[TRAINING PYTORCH MODELS...]",
-  "[CALIBRATING MAD THRESHOLDS...]",
-  "[SCANNING ROWS...]",
-  "[FINALIZING ENSEMBLE VOTES...]",
+  "[EXTRACTING FEATURES...]",
+  "[TRAINING MODELS...]",
+  "[CALIBRATING THRESHOLDS...]",
+  "[SCANNING CHUNKS...]",
+  "[FINALIZING RESULTS...]",
 ] as const;
 
 /* ------------------------------------------------------------------ */
@@ -127,6 +127,7 @@ export default function HomePage() {
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [filterQuery, setFilterQuery] = useState("");
+  const [uploadProgress, setUploadProgress] = useState(0);
 
   /* ---- File handling -------------------------------------------- */
   const handleFile = useCallback((f: File | null) => {
@@ -168,13 +169,31 @@ export default function HomePage() {
     setLiveStats(null);
     setResults(null);
     setError(null);
+    setUploadProgress(0);
 
     try {
       const formData = new FormData();
       formData.append("file", file);
 
-      const response = await fetch(`${API_URL}/scan-stream`, {
-        method: 'POST', body: formData
+      const response = await new Promise<Response>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.upload.addEventListener('progress', (e) => {
+          if (e.lengthComputable) {
+            setUploadProgress(Math.round((e.loaded / e.total) * 100));
+          }
+        });
+        xhr.addEventListener('load', () => {
+          resolve(new Response(xhr.response, {
+            status: xhr.status,
+            headers: {
+              'Content-Type': xhr.getResponseHeader('Content-Type') || ''
+            }
+          }));
+        });
+        xhr.addEventListener('error', () => reject(new Error('Upload failed')));
+        xhr.open('POST', `${API_URL}/scan-stream`);
+        xhr.responseType = 'blob';
+        xhr.send(formData);
       });
       
       if (!response.body) throw new Error("No readable stream available");
@@ -343,7 +362,7 @@ export default function HomePage() {
             ref={fileInputRef}
             id="file-input"
             type="file"
-            accept=".csv,.zip"
+            accept=".csv,.zip,.parquet"
             className="hidden"
             onChange={(e) => handleFile(e.target.files?.[0] ?? null)}
           />
@@ -364,7 +383,8 @@ export default function HomePage() {
               </p>
               <p className="font-mono text-xs text-zinc-600">
                 <span className="text-orange-500">.csv</span> tabular data &nbsp;·&nbsp;{" "}
-                <span className="text-orange-500">.zip</span> image archives
+                <span className="text-orange-500">.zip</span> image archives &nbsp;·&nbsp;{" "}
+                <span className="text-orange-500">.parquet</span>{" "}HuggingFace datasets
               </p>
             </div>
           )}
@@ -432,8 +452,14 @@ export default function HomePage() {
                   [UPLOADING PAYLOAD...]
                 </p>
                 <div className="w-full h-px bg-zinc-800 overflow-hidden">
-                  <div className="h-full w-1/4 bg-orange-500 animate-[progress-slide_1.4s_ease-in-out_infinite]" />
+                  <div
+                    className="h-full bg-orange-500 transition-all duration-300"
+                    style={{ width: `${uploadProgress}%` }}
+                  />
                 </div>
+                <p className="font-mono text-[10px] text-zinc-600">
+                  {uploadProgress}% uploaded
+                </p>
               </div>
             ) : (
               <div className="flex flex-col items-center gap-4 w-full max-w-xs">
@@ -441,8 +467,9 @@ export default function HomePage() {
                   key={scanPhase || stepIndex}
                   className="font-mono text-xs text-orange-500 text-center uppercase tracking-widest animate-fade-in"
                 >
-                  {scanPhase === "TRAINING_MODELS" ? "[TRAINING PYTORCH MODELS...]" : 
-                   scanPhase === "CALIBRATING" ? "[CALIBRATING MAD THRESHOLDS...]" : 
+                  {scanPhase === "UPLOADING"       ? "[UPLOADING PAYLOAD...]"      :
+                   scanPhase === "TRAINING_MODELS" ? "[TRAINING MODELS...]"        :
+                   scanPhase === "CALIBRATING"     ? "[CALIBRATING THRESHOLDS...]" :
                    SCAN_MESSAGES[stepIndex]}
                 </p>
                 {/* step marker dots */}
@@ -459,8 +486,27 @@ export default function HomePage() {
                   ))}
                 </div>
                 {liveStats && (
-                  <div className="font-mono text-xs text-zinc-400">
-                    {liveStats.total.toLocaleString()} rows scanned · {liveStats.poisoned} flagged so far
+                  <div className="flex flex-col items-center gap-1">
+                    <div className="font-mono text-xs text-zinc-400">
+                      chunk {liveStats.chunk} &middot;{" "}
+                      {liveStats.total.toLocaleString()} samples scanned
+                    </div>
+                    <div className="font-mono text-xs text-red-400">
+                      {liveStats.poisoned} anomalies detected so far
+                    </div>
+                    <div className="w-48 h-1 bg-zinc-800 rounded-none overflow-hidden mt-1">
+                      <div
+                        className="h-full bg-orange-500 transition-all duration-500"
+                        style={{
+                          width: liveStats.poisoned > 0
+                            ? `${Math.min(
+                                (liveStats.poisoned / liveStats.total) * 100 * 10,
+                                100
+                              )}%`
+                            : '0%'
+                        }}
+                      />
+                    </div>
                   </div>
                 )}
               </div>
@@ -902,6 +948,23 @@ export default function HomePage() {
           <span>Autoencoder · Deep SVDD · Isolation Forest</span>
         </div>
       </footer>
+
+      {/* ── API Access ─────────────────────────────────────────────── */}
+      <div className="border-t border-zinc-800 bg-zinc-900 px-6 py-8 mx-auto w-full max-w-7xl">
+        <h2 className="font-mono text-xs font-bold text-zinc-500 uppercase tracking-widest mb-4">
+          API ACCESS
+        </h2>
+        <pre className="font-mono text-[10px] text-zinc-400 bg-zinc-950 border border-zinc-800 p-4 overflow-x-auto">
+{`# Scan a dataset programmatically
+curl -X POST ${API_URL}/scan-dataset \\
+  -F "file=@your_dataset.csv" \\
+  -H "X-API-Key: your_key_here"
+
+# Parquet files also supported
+curl -X POST ${API_URL}/scan-dataset \\
+  -F "file=@dataset.parquet"`}
+        </pre>
+      </div>
     </main>
   );
 }

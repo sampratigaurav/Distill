@@ -59,6 +59,9 @@ class UniversalExtractor:
         self._resnet: nn.Module | None = None
         self._transform: T.Compose | None = None
         self._text_model = None
+        self._clip_model = None
+        self._clip_preprocess = None
+        self._clip_tokenizer = None
         self.last_columns: List[str] = []
         self.last_images: dict[str, Image.Image] = {}
         self.current_chunk_text_snippets: dict[str, dict[str, str]] = {}
@@ -68,6 +71,17 @@ class UniversalExtractor:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             from sentence_transformers import SentenceTransformer
             self._text_model = SentenceTransformer("all-MiniLM-L6-v2").to(self.device)
+
+    def _load_clip(self) -> None:
+        if self._clip_model is None:
+            import open_clip
+            self._clip_model, _, self._clip_preprocess = (
+                open_clip.create_model_and_transforms(
+                    'ViT-B-32', pretrained='openai'
+                )
+            )
+            self._clip_model = self._clip_model.to(self.device)
+            self._clip_model.eval()
 
     # ------------------------------------------------------------------
     # Public API
@@ -93,11 +107,13 @@ class UniversalExtractor:
             return self._stream_csv(temp_path), temp_path
         elif filename.endswith(".zip"):
             return self._stream_zip(temp_path), temp_path
+        elif filename.endswith(".parquet"):
+            return self._stream_parquet(temp_path), temp_path
         else:
             os.remove(temp_path)
             raise HTTPException(
                 status_code=400,
-                detail="Unsupported file type: Please upload a .csv or a .zip archive.",
+                detail="Unsupported file type: Please upload a .csv, .parquet, or .zip archive.",
             )
 
     # ------------------------------------------------------------------
@@ -220,6 +236,22 @@ class UniversalExtractor:
             yield features, identifiers
             chunk_idx += 1
 
+    def _stream_parquet(self, file_path: str):
+        """Convert a Parquet file to a temp CSV and reuse the CSV pipeline."""
+        import pyarrow.parquet as pq
+        import tempfile
+        table = pq.read_table(file_path)
+        df = table.to_pandas()
+
+        fd, csv_path = tempfile.mkstemp(suffix='.csv')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                df.to_csv(f, index=False)
+            yield from self._stream_csv(csv_path)
+        finally:
+            if os.path.exists(csv_path):
+                os.remove(csv_path)
+
 
     # ZIP pipeline (content-aware)
     # ------------------------------------------------------------------
@@ -301,19 +333,19 @@ class UniversalExtractor:
         ])
 
     def _stream_zip_images(self, archive: zipfile.ZipFile, img_entries: list[str]):
-        """Embed images via ResNet-18 and yield chunked 512-dim feature vectors."""
-        if self._resnet is None:
-            self._load_resnet()
+        """Embed images via CLIP ViT-B-32 and yield chunked 512-dim feature vectors."""
+        if self._clip_model is None:
+            self._load_clip()
 
         _MAX_UNCOMPRESSED = 1073741824  # 1 GB strict limit
         running_size = 0
-        tensors: list[torch.Tensor] = []
+        pil_images: list[Image.Image] = []
         filenames: list[str] = []
-        
+
         self.last_columns.clear()
         self.last_images.clear()
-        
-        chunk_size = 64
+
+        chunk_size = 128
 
         for entry in img_entries:
             with archive.open(entry) as f:
@@ -329,24 +361,29 @@ class UniversalExtractor:
             img = Image.open(io.BytesIO(buf)).convert("RGB")
             filename = os.path.basename(entry)
             self.last_images[filename] = img.copy()
-            
-            tensor = self._transform(img)
-            tensors.append(tensor)
+
+            pil_images.append(img)
             filenames.append(filename)
-            
-            if len(tensors) >= chunk_size:
-                batch_tensor = torch.stack(tensors).to(self.device)
+
+            if len(pil_images) >= chunk_size:
+                batch_tensor = torch.stack(
+                    [self._clip_preprocess(img) for img in pil_images]
+                ).to(self.device)
                 with torch.no_grad():
-                    features = self._resnet(batch_tensor).cpu().numpy()
+                    features = self._clip_model.encode_image(batch_tensor)
+                    features = features.cpu().float().numpy()
                 yield features, filenames
-                
+
                 # Clear per-chunk memory to stay OOM-safe
                 self.last_images.clear()
-                tensors = []
+                pil_images = []
                 filenames = []
-                
-        if tensors:
-            batch_tensor = torch.stack(tensors).to(self.device)
+
+        if pil_images:
+            batch_tensor = torch.stack(
+                [self._clip_preprocess(img) for img in pil_images]
+            ).to(self.device)
             with torch.no_grad():
-                features = self._resnet(batch_tensor).cpu().numpy()
+                features = self._clip_model.encode_image(batch_tensor)
+                features = features.cpu().float().numpy()
             yield features, filenames
