@@ -754,45 +754,6 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
                 c_raw_svdd = _blend(c_raw_svdd, cosine_scores)
                 c_raw_iso  = _blend(c_raw_iso,  cosine_scores)
             
-            import logging
-            logging.warning(f"Fix B check — last_clip_similarities type: "
-                            f"{type(extractor.last_clip_similarities)}, "
-                            f"last_images: {bool(extractor.last_images)}")
-            # Fix B: CLIP zero-shot override when text prompt was provided
-            if (extractor.last_images and 
-                    hasattr(extractor, 'last_clip_similarities') and
-                    extractor.last_clip_similarities is not None and
-                    isinstance(extractor.last_clip_similarities, dict)):
-                # Safer: build for ml_features samples only
-                ml_identifiers = [
-                    ident for i, ident in enumerate(identifiers) 
-                    if not hard_flags[i]
-                ]
-                clip_sims = np.array([
-                    extractor.last_clip_similarities.get(ident, 0.5)
-                    for ident in ml_identifiers
-                ], dtype=np.float32)
-                
-                if len(clip_sims) == len(ml_features):
-                    # Invert: low similarity to "normal" = high anomaly
-                    clip_min, clip_max = clip_sims.min(), clip_sims.max()
-                    clip_norm = (clip_sims - clip_min) / (
-                        clip_max - clip_min + 1e-8)
-                    clip_anomaly = 1.0 - clip_norm  # high = anomalous
-                    
-                    logging.warning(f"Fix B firing — clip_sims shape: {clip_sims.shape}")
-                    logging.warning(f"Fix B clip_sims values: {clip_sims}")
-                    logging.warning(f"Fix B clip_anomaly values: {clip_anomaly}")
-                    logging.warning(f"Fix B identifiers: {ml_identifiers}")
-                    
-                    # Override with clip-weighted blend (70% clip, 30% model)
-                    def _blend_clip(raw, clip_a, w_clip=0.7):
-                        raw_n = (raw - raw.min()) / (raw.max() - raw.min() + 1e-8)
-                        return (0.3 * raw_n + w_clip * clip_a).astype(np.float32)
-                    c_raw_ae   = _blend_clip(c_raw_ae,   clip_anomaly)
-                    c_raw_svdd = _blend_clip(c_raw_svdd, clip_anomaly)
-                    c_raw_iso  = _blend_clip(c_raw_iso,  clip_anomaly)
-
             # Apply frozen thresholds
             ae_flags = _evaluate_binary_votes(c_raw_ae, ae_median, ae_mad, ae_thresh)
             svdd_flags = _evaluate_binary_votes(c_raw_svdd, svdd_median, svdd_mad, svdd_thresh)
@@ -805,6 +766,46 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
             # Weighted ensemble confidence (AE+SVDD weighted higher, ISO lower)
             # because AE and SVDD are trained specifically on this data
             ensemble_conf = (0.4*conf_ae + 0.4*conf_svdd + 0.2*conf_iso)
+
+            # Fix B: CLIP zero-shot direct voting
+            if (hasattr(extractor, 'last_clip_similarities') and
+                    extractor.last_clip_similarities is not None and
+                    isinstance(extractor.last_clip_similarities, dict)):
+                
+                ml_identifiers = [
+                    ident for i, ident in enumerate(identifiers) 
+                    if not hard_flags[i]
+                ]
+                clip_sims = np.array([
+                    extractor.last_clip_similarities.get(ident, 0.5)
+                    for ident in ml_identifiers
+                ], dtype=np.float32)
+                
+                if len(clip_sims) == len(ml_features):
+                    clip_min, clip_max = clip_sims.min(), clip_sims.max()
+                    clip_norm = (clip_sims - clip_min) / (
+                        clip_max - clip_min + 1e-8)
+                    clip_anomaly = 1.0 - clip_norm
+
+                    import logging
+                    logging.warning(f"Fix B firing — clip_sims shape: {clip_sims.shape}")
+                    logging.warning(f"Fix B clip_sims values: {clip_sims}")
+                    logging.warning(f"Fix B clip_anomaly values: {clip_anomaly}")
+                    logging.warning(f"Fix B identifiers: {ml_identifiers}")
+
+                    # Samples with clip_anomaly > 0.5 get forced votes
+                    # from all three models — overrides MAD thresholding
+                    clip_votes = (clip_anomaly > 0.5).astype(np.int32)
+                    ae_flags   = np.maximum(ae_flags,   clip_votes)
+                    svdd_flags = np.maximum(svdd_flags, clip_votes)
+                    iso_flags  = np.maximum(iso_flags,  clip_votes)
+
+                    # Also boost confidence scores for clip-flagged samples
+                    clip_conf = clip_anomaly.clip(0, 1)
+                    conf_ae   = np.maximum(conf_ae,   clip_conf)
+                    conf_svdd = np.maximum(conf_svdd, clip_conf)
+                    conf_iso  = np.maximum(conf_iso,  clip_conf)
+                    ensemble_conf = np.maximum(ensemble_conf, clip_conf)
             
             model_breakdown[MODEL_AE] += int(ae_flags.sum())
             model_breakdown[MODEL_SVDD] += int(svdd_flags.sum())
