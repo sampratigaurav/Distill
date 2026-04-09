@@ -336,7 +336,7 @@ class UniversalExtractor:
             ),
         ])
 
-    def _stream_zip_images(self, archive: zipfile.ZipFile, 
+    def _stream_zip_images(self, archive: zipfile.ZipFile,
                            img_entries: list[str],
                            text_prompt: str | None = None):
         if self._clip_model is None:
@@ -344,59 +344,16 @@ class UniversalExtractor:
 
         _MAX_UNCOMPRESSED = 1073741824
         running_size = 0
+        chunk_size = 128
 
         self.last_columns.clear()
         self.last_images.clear()
         self.last_clip_similarities = None
 
-        chunk_size = 128
-
-        # Phase 1: Load all images
-        all_pil: list[Image.Image] = []
-        all_names: list[str] = []
-
-        for entry in img_entries:
-            with archive.open(entry) as f:
-                buf = bytearray()
-                while True:
-                    chunk = f.read(8192)
-                    if not chunk:
-                        break
-                    running_size += len(chunk)
-                    if running_size > _MAX_UNCOMPRESSED:
-                        raise HTTPException(413, "Physical limits exceeded.")
-                    buf.extend(chunk)
-
-            img = Image.open(io.BytesIO(buf)).convert("RGB")
-            filename = os.path.basename(entry)
-            self.last_images[filename] = img.copy()
-            all_pil.append(img)
-            all_names.append(filename)
-
-        # Phase 2: Encode ALL images with CLIP upfront
-        all_features_list: list[np.ndarray] = []
-        for i in range(0, len(all_pil), chunk_size):
-            batch_pil = all_pil[i:i + chunk_size]
-            batch_tensor = torch.stack(
-                [self._clip_preprocess(img) for img in batch_pil]
-            ).to(self.device)
-            with torch.no_grad():
-                feats = self._clip_model.encode_image(batch_tensor)
-                feats = feats.cpu().float().numpy()
-            all_features_list.append(feats)
-
-        if not all_features_list:
-            return
-
-        all_features = np.concatenate(all_features_list, axis=0)
-
-        import logging
-        logging.warning(f"CLIP model loaded: {self._clip_model is not None}")
-        logging.warning(f"ResNet model loaded: {self._resnet is not None}")
-        logging.warning(f"Feature shape: {all_features.shape}")
-
-        # Phase 3: Zero-shot scoring BEFORE any yields
-        if text_prompt and text_prompt.strip() and self._clip_model is not None:
+        # Pre-compute text features once if prompt provided.
+        # This is the only thing that needs to exist for the full run.
+        text_features_np = None
+        if text_prompt and text_prompt.strip():
             import open_clip
             tokenizer = open_clip.get_tokenizer('ViT-B-32')
             text_tokens = tokenizer([text_prompt.strip()]).to(self.device)
@@ -404,23 +361,71 @@ class UniversalExtractor:
                 text_feats = self._clip_model.encode_text(text_tokens)
                 text_feats = text_feats / text_feats.norm(
                     dim=-1, keepdim=True)
-            img_feats_norm = all_features / (
-                np.linalg.norm(all_features, axis=1, keepdims=True) + 1e-8)
-            sims = (img_feats_norm @ 
-                    text_feats.cpu().float().numpy().T).squeeze(-1)
-            self.last_clip_similarities = {
-                name: float(sim) 
-                for name, sim in zip(all_names, sims)
-            }
+            text_features_np = text_feats.cpu().float().numpy()
+            self.last_clip_similarities = {}  # will fill per chunk
 
-        # Phase 4: Yield in chunks (last_images already populated above)
-        for i in range(0, len(all_names), chunk_size):
-            chunk_feats = all_features[i:i + chunk_size]
-            chunk_names = all_names[i:i + chunk_size]
-            # Update last_images to only current chunk for XAI
-            self.last_images = {
-                name: self.last_images[name] 
-                for name in chunk_names 
-                if name in self.last_images
-            }
-            yield chunk_feats, chunk_names
+        # Single-pass streaming: load chunk → encode → score → yield → discard
+        # Peak memory: chunk_size images + chunk_size features
+        # O(chunk_size) regardless of total dataset size
+        buffer_pil:   list[Image.Image] = []
+        buffer_names: list[str] = []
+
+        def _process_buffer(pil_buf, name_buf):
+            """Encode buffer, optionally score against text, yield."""
+            batch_tensor = torch.stack(
+                [self._clip_preprocess(im) for im in pil_buf]
+            ).to(self.device)
+            with torch.no_grad():
+                feats = self._clip_model.encode_image(batch_tensor)
+                feats_np = feats.cpu().float().numpy()
+
+            import logging
+            logging.warning(f"CLIP model loaded: {self._clip_model is not None}")
+            logging.warning(f"ResNet model loaded: {self._resnet is not None}")
+            logging.warning(f"Feature shape: {feats_np.shape}")
+
+            # Zero-shot scoring: one float per image, store in dict
+            if text_features_np is not None:
+                norms = np.linalg.norm(feats_np, axis=1, keepdims=True)
+                feats_norm = feats_np / (norms + 1e-8)
+                sims = (feats_norm @ text_features_np.T).squeeze(-1)
+                for name, sim in zip(name_buf, sims):
+                    self.last_clip_similarities[name] = float(sim)
+
+            # Update last_images to current chunk only (for XAI)
+            self.last_images.clear()
+            for name, pil in zip(name_buf, pil_buf):
+                self.last_images[name] = pil
+
+            return feats_np, name_buf
+
+        for entry in img_entries:
+            with archive.open(entry) as f:
+                buf = bytearray()
+                while True:
+                    raw = f.read(8192)
+                    if not raw:
+                        break
+                    running_size += len(raw)
+                    if running_size > _MAX_UNCOMPRESSED:
+                        raise HTTPException(413, "Physical limits exceeded.")
+                    buf.extend(raw)
+
+            img = Image.open(io.BytesIO(buf)).convert("RGB")
+            filename = os.path.basename(entry)
+            buffer_pil.append(img)
+            buffer_names.append(filename)
+
+            if len(buffer_pil) >= chunk_size:
+                feats_np, names = _process_buffer(buffer_pil, buffer_names)
+                yield feats_np, names
+                # Discard everything — PIL, features, all of it
+                buffer_pil = []
+                buffer_names = []
+
+        # Final partial buffer
+        if buffer_pil:
+            feats_np, names = _process_buffer(buffer_pil, buffer_names)
+            yield feats_np, names
+            buffer_pil = []
+            buffer_names = []
