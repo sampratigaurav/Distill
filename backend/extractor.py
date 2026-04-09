@@ -375,6 +375,10 @@ class UniversalExtractor:
                 with torch.no_grad():
                     features = self._clip_model.encode_image(batch_tensor)
                     features = features.cpu().float().numpy()
+                    import logging
+                    logging.warning(f"CLIP model loaded: {self._clip_model is not None}")
+                    logging.warning(f"ResNet model loaded: {self._resnet is not None}")
+                    logging.warning(f"Feature shape: {features.shape}")
                 yield features, filenames
 
                 # Clear per-chunk memory to stay OOM-safe
@@ -389,4 +393,8 @@ class UniversalExtractor:
             with torch.no_grad():
                 features = self._clip_model.encode_image(batch_tensor)
                 features = features.cpu().float().numpy()
+                import logging
+                logging.warning(f"CLIP model loaded: {self._clip_model is not None}")
+                logging.warning(f"ResNet model loaded: {self._resnet is not None}")
+                logging.warning(f"Feature shape: {features.shape}")
             yield features, filenames
