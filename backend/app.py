@@ -795,7 +795,33 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
 
                     # Samples with clip_anomaly > 0.5 get forced votes
                     # from all three models — overrides MAD thresholding
-                    clip_votes = (clip_anomaly > 0.5).astype(np.int32)
+                    # Adaptive threshold: find natural gap in clip_anomaly distribution
+                    # Same philosophy as _find_natural_threshold for MAD scoring.
+                    # Sort anomaly scores, look for the largest gap in the upper 30%,
+                    # use that as the split point. Falls back to median + 1.5*IQR 
+                    # if no clear gap exists.
+                    def _clip_adaptive_threshold(scores: np.ndarray) -> float:
+                        if len(scores) < 4:
+                            return 0.6  # not enough data, safe fallback
+                        sorted_s = np.sort(scores)
+                        gaps = np.diff(sorted_s)
+                        upper_start = int(len(gaps) * 0.60)
+                        upper_gaps = gaps[upper_start:]
+                        if len(upper_gaps) > 0 and upper_gaps.mean() > 0:
+                            if upper_gaps.max() > 2.5 * upper_gaps.mean():
+                                cliff_idx = upper_start + np.argmax(upper_gaps)
+                                return float(sorted_s[cliff_idx])
+                        # Fallback: median + 1.5 * IQR
+                        q1, q3 = np.percentile(scores, [25, 75])
+                        iqr = q3 - q1
+                        return float(min(np.median(scores) + 1.5 * iqr, 0.85))
+
+                    clip_threshold = _clip_adaptive_threshold(clip_anomaly)
+                    clip_votes = (clip_anomaly > clip_threshold).astype(np.int32)
+                    
+                    import logging
+                    logging.warning(f"Fix B adaptive threshold: {clip_threshold:.4f}")
+                    logging.warning(f"Fix B votes: {clip_votes}")
                     ae_flags   = np.maximum(ae_flags,   clip_votes)
                     svdd_flags = np.maximum(svdd_flags, clip_votes)
                     iso_flags  = np.maximum(iso_flags,  clip_votes)
