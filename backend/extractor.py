@@ -55,6 +55,7 @@ class UniversalExtractor:
     """
 
     def __init__(self) -> None:
+        self.last_clip_similarities: np.ndarray | None = None
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
@@ -91,7 +92,7 @@ class UniversalExtractor:
     # ------------------------------------------------------------------
 
     async def process_upload(
-        self, file: UploadFile
+        self, file: UploadFile, text_prompt: str | None = None
     ) -> Tuple[object, str]:
         """
         Save file to temp storage and return (generator_stream, temp_file_path).
@@ -109,7 +110,7 @@ class UniversalExtractor:
         if filename.endswith(".csv"):
             return self._stream_csv(temp_path), temp_path
         elif filename.endswith(".zip"):
-            return self._stream_zip(temp_path), temp_path
+            return self._stream_zip(temp_path, text_prompt), temp_path
         elif filename.endswith(".parquet"):
             return self._stream_parquet(temp_path), temp_path
         else:
@@ -259,7 +260,7 @@ class UniversalExtractor:
     # ZIP pipeline (content-aware)
     # ------------------------------------------------------------------
 
-    def _stream_zip(self, temp_path: str):
+    def _stream_zip(self, temp_path: str, text_prompt: str | None = None):
         with zipfile.ZipFile(temp_path) as archive:
             csv_entries: list[str] = []
             img_entries: list[str] = []
@@ -276,7 +277,7 @@ class UniversalExtractor:
             if csv_entries:
                 yield from self._stream_zip_csvs(archive, csv_entries)
             elif img_entries:
-                yield from self._stream_zip_images(archive, img_entries)
+                yield from self._stream_zip_images(archive, img_entries, text_prompt)
             else:
                 raise HTTPException(status_code=400, detail="The archive contains no supported files.")
 
@@ -335,27 +336,32 @@ class UniversalExtractor:
             ),
         ])
 
-    def _stream_zip_images(self, archive: zipfile.ZipFile, img_entries: list[str]):
-        """Embed images via CLIP ViT-B-32 and yield chunked 512-dim feature vectors."""
+    def _stream_zip_images(self, archive: zipfile.ZipFile, 
+                           img_entries: list[str],
+                           text_prompt: str | None = None):
         if self._clip_model is None:
             self._load_clip()
 
-        _MAX_UNCOMPRESSED = 1073741824  # 1 GB strict limit
+        _MAX_UNCOMPRESSED = 1073741824
         running_size = 0
-        pil_images: list[Image.Image] = []
-        filenames: list[str] = []
 
         self.last_columns.clear()
         self.last_images.clear()
+        self.last_clip_similarities = None
 
         chunk_size = 128
+
+        # Phase 1: Load all images
+        all_pil: list[Image.Image] = []
+        all_names: list[str] = []
 
         for entry in img_entries:
             with archive.open(entry) as f:
                 buf = bytearray()
                 while True:
                     chunk = f.read(8192)
-                    if not chunk: break
+                    if not chunk:
+                        break
                     running_size += len(chunk)
                     if running_size > _MAX_UNCOMPRESSED:
                         raise HTTPException(413, "Physical limits exceeded.")
@@ -364,37 +370,57 @@ class UniversalExtractor:
             img = Image.open(io.BytesIO(buf)).convert("RGB")
             filename = os.path.basename(entry)
             self.last_images[filename] = img.copy()
+            all_pil.append(img)
+            all_names.append(filename)
 
-            pil_images.append(img)
-            filenames.append(filename)
-
-            if len(pil_images) >= chunk_size:
-                batch_tensor = torch.stack(
-                    [self._clip_preprocess(img) for img in pil_images]
-                ).to(self.device)
-                with torch.no_grad():
-                    features = self._clip_model.encode_image(batch_tensor)
-                    features = features.cpu().float().numpy()
-                    import logging
-                    logging.warning(f"CLIP model loaded: {self._clip_model is not None}")
-                    logging.warning(f"ResNet model loaded: {self._resnet is not None}")
-                    logging.warning(f"Feature shape: {features.shape}")
-                yield features, filenames
-
-                # Clear per-chunk memory to stay OOM-safe
-                self.last_images.clear()
-                pil_images = []
-                filenames = []
-
-        if pil_images:
+        # Phase 2: Encode ALL images with CLIP upfront
+        all_features_list: list[np.ndarray] = []
+        for i in range(0, len(all_pil), chunk_size):
+            batch_pil = all_pil[i:i + chunk_size]
             batch_tensor = torch.stack(
-                [self._clip_preprocess(img) for img in pil_images]
+                [self._clip_preprocess(img) for img in batch_pil]
             ).to(self.device)
             with torch.no_grad():
-                features = self._clip_model.encode_image(batch_tensor)
-                features = features.cpu().float().numpy()
-                import logging
-                logging.warning(f"CLIP model loaded: {self._clip_model is not None}")
-                logging.warning(f"ResNet model loaded: {self._resnet is not None}")
-                logging.warning(f"Feature shape: {features.shape}")
-            yield features, filenames
+                feats = self._clip_model.encode_image(batch_tensor)
+                feats = feats.cpu().float().numpy()
+            all_features_list.append(feats)
+
+        if not all_features_list:
+            return
+
+        all_features = np.concatenate(all_features_list, axis=0)
+
+        import logging
+        logging.warning(f"CLIP model loaded: {self._clip_model is not None}")
+        logging.warning(f"ResNet model loaded: {self._resnet is not None}")
+        logging.warning(f"Feature shape: {all_features.shape}")
+
+        # Phase 3: Zero-shot scoring BEFORE any yields
+        if text_prompt and text_prompt.strip() and self._clip_model is not None:
+            import open_clip
+            tokenizer = open_clip.get_tokenizer('ViT-B-32')
+            text_tokens = tokenizer([text_prompt.strip()]).to(self.device)
+            with torch.no_grad():
+                text_feats = self._clip_model.encode_text(text_tokens)
+                text_feats = text_feats / text_feats.norm(
+                    dim=-1, keepdim=True)
+            img_feats_norm = all_features / (
+                np.linalg.norm(all_features, axis=1, keepdims=True) + 1e-8)
+            sims = (img_feats_norm @ 
+                    text_feats.cpu().float().numpy().T).squeeze(-1)
+            self.last_clip_similarities = {
+                name: float(sim) 
+                for name, sim in zip(all_names, sims)
+            }
+
+        # Phase 4: Yield in chunks (last_images already populated above)
+        for i in range(0, len(all_names), chunk_size):
+            chunk_feats = all_features[i:i + chunk_size]
+            chunk_names = all_names[i:i + chunk_size]
+            # Update last_images to only current chunk for XAI
+            self.last_images = {
+                name: self.last_images[name] 
+                for name in chunk_names 
+                if name in self.last_images
+            }
+            yield chunk_feats, chunk_names

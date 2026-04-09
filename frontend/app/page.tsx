@@ -128,6 +128,7 @@ export default function HomePage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [filterQuery, setFilterQuery] = useState("");
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [textPrompt, setTextPrompt] = useState<string>("");
 
   /* ---- File handling -------------------------------------------- */
   const handleFile = useCallback((f: File | null) => {
@@ -174,6 +175,9 @@ export default function HomePage() {
     try {
       const formData = new FormData();
       formData.append("file", file);
+      if (textPrompt.trim()) {
+        formData.append("text_prompt", textPrompt.trim());
+      }
 
       const response = await new Promise<Response>((resolve, reject) => {
         const xhr = new XMLHttpRequest();
@@ -389,6 +393,26 @@ export default function HomePage() {
             </div>
           )}
         </section>
+
+        <div className="flex flex-col gap-1.5">
+          <label className="font-mono text-[10px] text-zinc-500 
+                            uppercase tracking-widest">
+            Describe normal data{" "}
+            <span className="text-zinc-700 normal-case tracking-normal">
+              (optional — images only, uses CLIP zero-shot)
+            </span>
+          </label>
+          <input
+            type="text"
+            placeholder='e.g. "a photo of a man" — leave blank for unsupervised mode'
+            value={textPrompt}
+            onChange={(e) => setTextPrompt(e.target.value)}
+            className="border border-zinc-800 bg-zinc-950 px-3 py-2 
+                       font-mono text-xs text-zinc-300 
+                       placeholder-zinc-600 focus:outline-none 
+                       focus:border-orange-500 rounded-none w-full"
+          />
+        </div>
 
         {/* ── Scan Button ────────────────────────────────────────── */}
         <div className="flex items-center justify-between gap-4">

@@ -55,7 +55,7 @@ Whether you're uploading a CSV of network logs, a ZIP of training images, or a d
 | Data Type | Pipeline |
 |-----------|----------|
 | **Tabular / CSV** | Pandas scaling + OneHot encoding via scikit-learn |
-| **Images (ZIP)** | Headless **ResNet-18** → 512-dim embedding |
+| **Images (ZIP)** | **CLIP ViT-B/32** → 512-dim embedding |
 | **Free Text** | **SentenceTransformer** (`all-MiniLM-L6-v2`) → 384-dim semantic vector |
 
 Distill auto-detects column types and routes your data through the correct extraction pipeline — no configuration required.
@@ -122,7 +122,7 @@ Distill is engineered for adversarial environments:
 |-----------|------------|
 | Framework | **FastAPI** + Uvicorn |
 | Deep Learning | **PyTorch** — DynamicAutoencoder, DynamicDeepSVDD |
-| Computer Vision | **Torchvision** ResNet-18 |
+| Computer Vision | **OpenCLIP** ViT-B/32 |
 | NLP Embeddings | **SentenceTransformers** `all-MiniLM-L6-v2` |
 | Classical ML | **scikit-learn** IsolationForest |
 | Data Processing | **Pandas**, NumPy |
@@ -398,7 +398,7 @@ pip install modal
 modal deploy app.py::modal_app
 ```
 
-The Modal image pre-caches both ResNet-18 weights and `all-MiniLM-L6-v2` during build to eliminate cold-start latency.
+The Modal image pre-caches both CLIP ViT-B/32 weights and `all-MiniLM-L6-v2` during build to eliminate cold-start latency.
 
 ### Frontend → Vercel
 

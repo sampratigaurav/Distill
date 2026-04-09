@@ -233,6 +233,25 @@ def _statistical_prefilter(
     return hard_flags
 
 
+def _cosine_similarity_scores(features: np.ndarray) -> np.ndarray:
+    """
+    Score each sample by its average pairwise cosine similarity to 
+    all other samples. Low average similarity = more anomalous.
+    Returns anomaly scores (high = anomalous) shaped (n_samples,).
+    Uses sklearn's cosine_similarity for efficiency.
+    """
+    from sklearn.metrics.pairwise import cosine_similarity
+    n = len(features)
+    if n < 2:
+        return np.zeros(n, dtype=np.float32)
+    sim_matrix = cosine_similarity(features)  # (n, n)
+    # Average similarity to all OTHER samples (exclude self-similarity)
+    avg_sim = (sim_matrix.sum(axis=1) - 1.0) / max(n - 1, 1)
+    # Invert: low similarity = high anomaly score
+    anomaly_scores = 1.0 - avg_sim
+    return anomaly_scores.astype(np.float32)
+
+
 def _train_autoencoder(train_tensor: torch.Tensor, input_dim: int) -> DynamicAutoencoder:
     """Train a DynamicAutoencoder with Early Stopping on the primary chunk."""
     model = DynamicAutoencoder(input_dim).to(device)
@@ -653,6 +672,16 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
     raw_svdd = _evaluate_deep_svdd(svdd_model, chunk0_tensor)
     raw_iso = _evaluate_isolation_forest(iso_model, first_features, pca)
     
+    if extractor.last_images or input_dim >= 384:
+        cosine_scores_cal = _cosine_similarity_scores(first_features)
+        def _blend_cal(raw, cos, alpha=0.5):
+            raw_n = (raw - raw.min()) / (raw.ptp() + 1e-8)
+            cos_n = (cos - cos.min()) / (cos.ptp() + 1e-8)
+            return ((1 - alpha) * raw_n + alpha * cos_n).astype(np.float32)
+        raw_ae   = _blend_cal(raw_ae,   cosine_scores_cal)
+        raw_svdd = _blend_cal(raw_svdd, cosine_scores_cal)
+        raw_iso  = _blend_cal(raw_iso,  cosine_scores_cal)
+    
     # Freeze thresholds using Chunk 0 topography
     chunk0_len = len(first_features)
     ae_median, ae_mad, ae_thresh = _calibrate_mad_threshold(raw_ae, chunk0_len)
@@ -711,6 +740,50 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
             c_raw_svdd = _evaluate_deep_svdd(svdd_model, tensor)
             c_raw_iso = _evaluate_isolation_forest(iso_model, ml_features, pca)
             
+            # Fix A: For image/high-dim embeddings, blend cosine sim scores
+            # into the raw model scores for better unsupervised accuracy.
+            if extractor.last_images or input_dim >= 384:
+                cosine_scores = _cosine_similarity_scores(ml_features)
+                # Blend: weight cosine score 50% into each model's raw score
+                # by converting both to the same relative scale using min-max
+                def _blend(raw, cos, alpha=0.5):
+                    raw_n = (raw - raw.min()) / (raw.ptp() + 1e-8)
+                    cos_n = (cos - cos.min()) / (cos.ptp() + 1e-8)
+                    return ((1 - alpha) * raw_n + alpha * cos_n).astype(np.float32)
+                c_raw_ae   = _blend(c_raw_ae,   cosine_scores)
+                c_raw_svdd = _blend(c_raw_svdd, cosine_scores)
+                c_raw_iso  = _blend(c_raw_iso,  cosine_scores)
+            
+            # Fix B: CLIP zero-shot override when text prompt was provided
+            if (extractor.last_images and 
+                    hasattr(extractor, 'last_clip_similarities') and
+                    extractor.last_clip_similarities is not None and
+                    isinstance(extractor.last_clip_similarities, dict)):
+                # Safer: build for ml_features samples only
+                ml_identifiers = [
+                    ident for i, ident in enumerate(identifiers) 
+                    if not hard_flags[i]
+                ]
+                clip_sims = np.array([
+                    extractor.last_clip_similarities.get(ident, 0.5)
+                    for ident in ml_identifiers
+                ], dtype=np.float32)
+                
+                if len(clip_sims) == len(ml_features):
+                    # Invert: low similarity to "normal" = high anomaly
+                    clip_min, clip_max = clip_sims.min(), clip_sims.max()
+                    clip_norm = (clip_sims - clip_min) / (
+                        clip_max - clip_min + 1e-8)
+                    clip_anomaly = 1.0 - clip_norm  # high = anomalous
+                    
+                    # Override with clip-weighted blend (70% clip, 30% model)
+                    def _blend_clip(raw, clip_a, w_clip=0.7):
+                        raw_n = (raw - raw.min()) / (raw.ptp() + 1e-8)
+                        return (0.3 * raw_n + w_clip * clip_a).astype(np.float32)
+                    c_raw_ae   = _blend_clip(c_raw_ae,   clip_anomaly)
+                    c_raw_svdd = _blend_clip(c_raw_svdd, clip_anomaly)
+                    c_raw_iso  = _blend_clip(c_raw_iso,  clip_anomaly)
+
             # Apply frozen thresholds
             ae_flags = _evaluate_binary_votes(c_raw_ae, ae_median, ae_mad, ae_thresh)
             svdd_flags = _evaluate_binary_votes(c_raw_svdd, svdd_median, svdd_mad, svdd_thresh)
@@ -776,6 +849,7 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
 async def scan_dataset(
     request: Request,
     file: UploadFile = File(...),
+    text_prompt: str | None = Form(None),
     _: bool = Depends(verify_api_key),
 ):
     """
@@ -789,7 +863,8 @@ async def scan_dataset(
         random.seed(42)
 
         # 1. Mount the generator stream
-        data_stream, temp_path = await extractor.process_upload(file)
+        data_stream, temp_path = await extractor.process_upload(
+            file, text_prompt=text_prompt)
 
         try:
             loop = asyncio.get_event_loop()
@@ -811,6 +886,7 @@ async def scan_dataset(
 async def scan_stream(
     request: Request,
     file: UploadFile = File(...),
+    text_prompt: str | None = Form(None),
     _: bool = Depends(verify_api_key),
 ):
     """
@@ -820,7 +896,8 @@ async def scan_stream(
         try:
             yield f"data: {json.dumps({'event':'phase','data':'UPLOADING'})}\n\n"
             
-            data_stream, temp_path = await extractor.process_upload(file)
+            data_stream, temp_path = await extractor.process_upload(
+                file, text_prompt=text_prompt)
             
             yield f"data: {json.dumps({'event':'phase','data':'TRAINING_MODELS'})}\n\n"
             
@@ -903,7 +980,7 @@ def _generate_pdf_receipt(scan_results: dict, filename: str) -> bytes:
         explanation = item.get("explanation")
         if explanation:
             if explanation.get("type") == "image":
-                pdf.cell(0, 6, "  Explanation: Latent Space Divergence detected in ResNet-18 features.", new_x="LMARGIN", new_y="NEXT")
+                pdf.cell(0, 6, "  Explanation: Latent Space Divergence detected in CLIP ViT-B/32 features.", new_x="LMARGIN", new_y="NEXT")
             elif explanation.get("type") == "tabular":
                 top_features = ", ".join([c["name"] for c in explanation.get("top_contributors", [])])
                 pdf.cell(0, 6, f"  Explanation: High reconstruction error in features: {top_features}", new_x="LMARGIN", new_y="NEXT")
