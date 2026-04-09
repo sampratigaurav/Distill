@@ -675,8 +675,8 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
     if extractor.last_images or input_dim >= 384:
         cosine_scores_cal = _cosine_similarity_scores(first_features)
         def _blend_cal(raw, cos, alpha=0.5):
-            raw_n = (raw - raw.min()) / (raw.ptp() + 1e-8)
-            cos_n = (cos - cos.min()) / (cos.ptp() + 1e-8)
+            raw_n = (raw - raw.min()) / (raw.max() - raw.min() + 1e-8)
+            cos_n = (cos - cos.min()) / (cos.max() - cos.min() + 1e-8)
             return ((1 - alpha) * raw_n + alpha * cos_n).astype(np.float32)
         raw_ae   = _blend_cal(raw_ae,   cosine_scores_cal)
         raw_svdd = _blend_cal(raw_svdd, cosine_scores_cal)
@@ -747,8 +747,8 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
                 # Blend: weight cosine score 50% into each model's raw score
                 # by converting both to the same relative scale using min-max
                 def _blend(raw, cos, alpha=0.5):
-                    raw_n = (raw - raw.min()) / (raw.ptp() + 1e-8)
-                    cos_n = (cos - cos.min()) / (cos.ptp() + 1e-8)
+                    raw_n = (raw - raw.min()) / (raw.max() - raw.min() + 1e-8)
+                    cos_n = (cos - cos.min()) / (cos.max() - cos.min() + 1e-8)
                     return ((1 - alpha) * raw_n + alpha * cos_n).astype(np.float32)
                 c_raw_ae   = _blend(c_raw_ae,   cosine_scores)
                 c_raw_svdd = _blend(c_raw_svdd, cosine_scores)
@@ -778,7 +778,7 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
                     
                     # Override with clip-weighted blend (70% clip, 30% model)
                     def _blend_clip(raw, clip_a, w_clip=0.7):
-                        raw_n = (raw - raw.min()) / (raw.ptp() + 1e-8)
+                        raw_n = (raw - raw.min()) / (raw.max() - raw.min() + 1e-8)
                         return (0.3 * raw_n + w_clip * clip_a).astype(np.float32)
                     c_raw_ae   = _blend_clip(c_raw_ae,   clip_anomaly)
                     c_raw_svdd = _blend_clip(c_raw_svdd, clip_anomaly)
