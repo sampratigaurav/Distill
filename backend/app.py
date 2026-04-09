@@ -1108,7 +1108,7 @@ distill_image = (
     image=distill_image,
     gpu="T4",
     memory=8192,
-    keep_warm=1,
+    min_containers=1,
 )
 @modal.asgi_app()
 def serve():
