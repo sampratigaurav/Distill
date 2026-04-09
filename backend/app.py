@@ -699,8 +699,14 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
     import itertools
     full_stream = itertools.chain([(first_features, first_identifiers)], data_stream)
 
-    # Circuit breaker: abort streaming after 45 seconds
-    _SCAN_TIMEOUT = 45.0
+    # Dynamic timeout: 1ms per expected sample, minimum 120s, 
+    # maximum 600s. Estimated from chunk 0 size extrapolated 
+    # across the full stream.
+    _BASE_TIMEOUT = 120.0
+    _MS_PER_SAMPLE = 0.001  # 1ms per sample conservative estimate
+    # We don't know total n yet, so start with base and extend
+    # dynamically as we see more chunks
+    _SCAN_TIMEOUT = _BASE_TIMEOUT
     start_time = time.time()
     
     chunk_idx = 1
@@ -715,6 +721,19 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
 
         chunk_len = len(features)
         total_samples += chunk_len
+        
+        # Extend timeout dynamically based on observed throughput
+        elapsed = time.time() - start_time
+        if total_samples > 0 and elapsed > 0:
+            rate = total_samples / elapsed  # samples per second
+            # Estimate remaining time from current rate
+            # We don't know total, so keep extending if making progress
+            _SCAN_TIMEOUT = max(
+                _SCAN_TIMEOUT,
+                elapsed + (chunk_len / max(rate, 1)) * 10
+            )
+            # Hard cap at 600 seconds regardless
+            _SCAN_TIMEOUT = min(_SCAN_TIMEOUT, 600.0)
         
         # Only run statistical prefilter on tabular data
         # For image embeddings (dim>=512) or NLP embeddings, skip it —
@@ -859,7 +878,7 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
 
 
 @app.post("/scan-dataset")
-@limiter.limit("5/minute")
+@limiter.limit("10/minute")
 async def scan_dataset(
     request: Request,
     file: UploadFile = File(...),
@@ -896,7 +915,7 @@ async def scan_dataset(
 
 
 @app.post("/scan-stream")
-@limiter.limit("5/minute")  
+@limiter.limit("10/minute")  
 async def scan_stream(
     request: Request,
     file: UploadFile = File(...),
