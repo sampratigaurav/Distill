@@ -871,7 +871,7 @@ export default function HomePage() {
                     LATENT SPACE DIVERGENCE — TOP DEVIANT FEATURES
                   </h4>
                   <p className="font-mono text-[10px] text-zinc-400 border border-red-500/20 bg-red-500/5 px-3 py-2 rounded-none">
-                    Specific ResNet-18 neural features that alienated this pattern.
+                    Specific CLIP ViT-B/32 features that alienated this pattern.
                   </p>
                   {selectedItem.explanation?.error ? (
                     <div className="flex flex-col items-center justify-center h-40 border border-red-500/30 text-red-500 font-mono text-xs p-4 rounded-none bg-zinc-950">

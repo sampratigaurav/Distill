@@ -754,6 +754,10 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
                 c_raw_svdd = _blend(c_raw_svdd, cosine_scores)
                 c_raw_iso  = _blend(c_raw_iso,  cosine_scores)
             
+            import logging
+            logging.warning(f"Fix B check — last_clip_similarities type: "
+                            f"{type(extractor.last_clip_similarities)}, "
+                            f"last_images: {bool(extractor.last_images)}")
             # Fix B: CLIP zero-shot override when text prompt was provided
             if (extractor.last_images and 
                     hasattr(extractor, 'last_clip_similarities') and
@@ -775,6 +779,11 @@ def _run_scan_pipeline(data_stream, progress_cb=None) -> dict:
                     clip_norm = (clip_sims - clip_min) / (
                         clip_max - clip_min + 1e-8)
                     clip_anomaly = 1.0 - clip_norm  # high = anomalous
+                    
+                    logging.warning(f"Fix B firing — clip_sims shape: {clip_sims.shape}")
+                    logging.warning(f"Fix B clip_sims values: {clip_sims}")
+                    logging.warning(f"Fix B clip_anomaly values: {clip_anomaly}")
+                    logging.warning(f"Fix B identifiers: {ml_identifiers}")
                     
                     # Override with clip-weighted blend (70% clip, 30% model)
                     def _blend_clip(raw, clip_a, w_clip=0.7):
