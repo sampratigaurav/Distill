@@ -10,6 +10,28 @@ Ensemble:     ≥ 2 / 3 model votes → "poisoned".
 
 from __future__ import annotations
 
+import sys
+try:
+    import modal
+except ImportError:
+    pass
+else:
+    if modal.is_local():
+        from unittest.mock import MagicMock
+        class _MockModule(MagicMock):
+            @classmethod
+            def __getattr__(cls, name):
+                return MagicMock()
+        
+        _heavy_modules = [
+            'fpdf', 'numpy', 'pandas', 'torch', 'torch.nn', 'torch.utils', 
+            'torch.utils.data', 'sklearn', 'sklearn.decomposition', 'sklearn.ensemble',
+            'sentence_transformers', 'open_clip', 'PIL', 'cv2', 'torchvision', 'torchvision.transforms',
+            'torchvision.models', 'slowapi', 'slowapi.errors', 'slowapi.util',
+            'extractor', 'models'
+        ]
+        for m in _heavy_modules:
+            sys.modules[m] = _MockModule()
 import io
 import uuid
 import json
