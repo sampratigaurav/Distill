@@ -1235,9 +1235,7 @@ distill_image = (
 # 4. Define the serverless function (no 'mounts' parameter needed here anymore)
 @modal_app.function(
     image=distill_image,
-    gpu="T4",
-    memory=8192,
-    min_containers=1,
+    gpu="any",
 )
 @modal.asgi_app()
 def serve():
